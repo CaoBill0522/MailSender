@@ -22,6 +22,7 @@ type Account struct {
 	Remark         string `json:"remark"`
 	Groups         string `gorm:"column:group_tags" json:"groups"` // comma separated tags; API keys bound to groups only use matching accounts
 	PreferDomains  string `json:"prefer_domains"`                  // comma separated recipient domains this account is tried first for
+	ProxyID        uint   `gorm:"index" json:"proxy_id"`           // egress SOCKS5 proxy; 0 = connect directly
 
 	// health state, maintained by the scheduler
 	ConsecutiveFails int        `json:"consecutive_fails"`
@@ -121,4 +122,24 @@ type Suppression struct {
 type Setting struct {
 	Key   string `gorm:"primaryKey"`
 	Value string
+}
+
+// Proxy is a SOCKS5 egress: accounts bound to it reach their SMTP server from the proxy's IP.
+type Proxy struct {
+	ID          uint   `gorm:"primaryKey" json:"id"`
+	Name        string `json:"name"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	Username    string `json:"username"`
+	PasswordEnc string `json:"-"`
+	Remark      string `json:"remark"`
+
+	LastIP        string     `json:"last_ip"` // egress IP seen by the last check
+	LastCheckAt   *time.Time `json:"last_check_at"`
+	LastCheckOK   bool       `json:"last_check_ok"`
+	LastError     string     `json:"last_error"`
+	LastLatencyMs int64      `json:"last_latency_ms"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

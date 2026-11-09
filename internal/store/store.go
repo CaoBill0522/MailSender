@@ -37,7 +37,7 @@ func Open(dataDir string) (*Store, error) {
 	}
 	// SQLite allows one writer; a single connection avoids "database is locked" under concurrency.
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&Account{}, &APIKey{}, &Message{}, &SendAttempt{}, &DailyStat{}, &Suppression{}, &Setting{}); err != nil {
+	if err := db.AutoMigrate(&Account{}, &APIKey{}, &Message{}, &SendAttempt{}, &DailyStat{}, &Suppression{}, &Proxy{}, &Setting{}); err != nil {
 		return nil, err
 	}
 	return &Store{DB: db}, nil

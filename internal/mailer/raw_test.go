@@ -80,7 +80,7 @@ func TestSendRawUsesBracketedEnvelope(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := Send(ctx, acc, "", Content{To: "user@example.com", Raw: raw}, 5*time.Second); err != nil {
+	if err := Send(ctx, acc, "", nil, Content{To: "user@example.com", Raw: raw}, 5*time.Second); err != nil {
 		t.Fatalf("send failed: %v", err)
 	}
 

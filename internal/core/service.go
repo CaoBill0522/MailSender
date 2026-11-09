@@ -152,7 +152,10 @@ func (s *Service) TestAccount(id uint) error {
 	timeout := time.Duration(s.Cfg.Get().SendTimeoutSec) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
-	err = mailer.Test(ctx, &lease.Account, lease.Password, timeout)
+	dial, err := s.DialerFor(&lease.Account)
+	if err == nil {
+		err = mailer.Test(ctx, &lease.Account, lease.Password, dial, timeout)
+	}
 	s.Sched.RecordCheck(id, err)
 	return err
 }
@@ -170,7 +173,11 @@ func (s *Service) TestSend(id uint, to string) error {
 	timeout := time.Duration(s.Cfg.Get().SendTimeoutSec) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
-	return mailer.Send(ctx, &lease.Account, lease.Password, mailer.Content{
+	dial, err := s.DialerFor(&lease.Account)
+	if err != nil {
+		return err
+	}
+	return mailer.Send(ctx, &lease.Account, lease.Password, dial, mailer.Content{
 		To:      addr.Address,
 		Subject: "MailSender 测试邮件",
 		Text:    fmt.Sprintf("这是一封来自 MailSender 的测试邮件。\n发件账号：%s <%s>\n时间：%s", lease.Account.Name, lease.Account.FromAddr, time.Now().Format(time.DateTime)),
@@ -338,7 +345,10 @@ func (s *Service) deliver(m *store.Message, c mailer.Content, rt Route) {
 		exclude[acc.ID] = true
 		t0 := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
-		err = mailer.Send(ctx, &acc, lease.Password, c, timeout)
+		var dial mailer.Dialer
+		if dial, err = s.DialerFor(&acc); err == nil {
+			err = mailer.Send(ctx, &acc, lease.Password, dial, c, timeout)
+		}
 		cancel()
 		dur := time.Since(t0).Milliseconds()
 		kind := mailer.Classify(err)

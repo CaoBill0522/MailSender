@@ -15,12 +15,12 @@ import (
 
 // sendRaw relays a complete RFC 5322 message (from the SMTP ingress) through the account,
 // rewriting the sender headers so SPF/DMARC align with the account actually sending.
-func sendRaw(ctx context.Context, acc *store.Account, password string, c Content, timeout time.Duration) error {
+func sendRaw(ctx context.Context, acc *store.Account, password string, dial Dialer, c Content, timeout time.Duration) error {
 	data, err := RewriteHeaders(c.Raw, acc.FromAddr, acc.FromName, c.MsgIDLocal)
 	if err != nil {
 		return fmt.Errorf("invalid message: %w", err)
 	}
-	cl, err := newClient(acc, password, timeout)
+	cl, err := newClient(acc, password, dial, timeout)
 	if err != nil {
 		return err
 	}

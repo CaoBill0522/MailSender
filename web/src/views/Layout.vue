@@ -46,6 +46,7 @@ const icon = (d) => () => h('svg', { viewBox: '0 0 24 24', width: 18, height: 18
 const menu = [
   { label: '概览', key: '/', icon: icon('M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z') },
   { label: 'SMTP 账号', key: '/accounts', icon: icon('M4 6h16v12H4zM4 7l8 6 8-6') },
+  { label: '出口代理', key: '/proxies', icon: icon('M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3.6 9h16.8M3.6 15h16.8M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18') },
   { label: 'API Key', key: '/keys', icon: icon('M15 7a4 4 0 1 1-3.9 5H3v3h3v3h3v-3h2.1A4 4 0 0 1 15 7z') },
   { label: '发送日志', key: '/messages', icon: icon('M4 5h16M4 10h16M4 15h10M4 20h7') },
   { label: '退信名单', key: '/suppressions', icon: icon('M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM5.6 5.6l12.8 12.8') },

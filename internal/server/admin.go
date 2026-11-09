@@ -61,6 +61,7 @@ type accountInput struct {
 	Remark         string `json:"remark"`
 	Groups         string `json:"groups"`
 	PreferDomains  string `json:"prefer_domains"`
+	ProxyID        uint   `json:"proxy_id"`
 }
 
 func (in *accountInput) normalize() error {
@@ -129,7 +130,7 @@ func (in *accountInput) apply(a *store.Account) {
 	a.Username, a.FromAddr, a.FromName, a.Weight = in.Username, in.FromAddr, in.FromName, in.Weight
 	a.LimitPerMinute, a.LimitPerHour, a.LimitPerDay = in.LimitPerMinute, in.LimitPerHour, in.LimitPerDay
 	a.Enabled, a.Remark = in.Enabled, in.Remark
-	a.Groups, a.PreferDomains = in.Groups, in.PreferDomains
+	a.Groups, a.PreferDomains, a.ProxyID = in.Groups, in.PreferDomains, in.ProxyID
 }
 
 func (s *Server) listAccounts(c *gin.Context) {
@@ -153,6 +154,10 @@ func (s *Server) createAccount(c *gin.Context) {
 		return
 	}
 	if err := in.normalize(); err != nil {
+		bad(c, err.Error())
+		return
+	}
+	if err := s.proxyExists(in.ProxyID); err != nil {
 		bad(c, err.Error())
 		return
 	}
@@ -186,6 +191,10 @@ func (s *Server) updateAccount(c *gin.Context) {
 		bad(c, err.Error())
 		return
 	}
+	if err := s.proxyExists(in.ProxyID); err != nil {
+		bad(c, err.Error())
+		return
+	}
 	var a store.Account
 	if err := s.db.DB.First(&a, id).Error; err != nil {
 		notFoundOr(c, err)
@@ -193,7 +202,7 @@ func (s *Server) updateAccount(c *gin.Context) {
 	}
 	in.apply(&a)
 	cols := []string{"name", "host", "port", "security", "auth_type", "username", "from_addr", "from_name",
-		"weight", "limit_per_minute", "limit_per_hour", "limit_per_day", "enabled", "remark", "group_tags", "prefer_domains"}
+		"weight", "limit_per_minute", "limit_per_hour", "limit_per_day", "enabled", "remark", "group_tags", "prefer_domains", "proxy_id"}
 	if in.Password != "" {
 		enc, err := s.box.Encrypt(in.Password)
 		if err != nil {
