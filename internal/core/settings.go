@@ -3,6 +3,9 @@ package core
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 
 	"mailsender/internal/store"
@@ -19,6 +22,21 @@ type Settings struct {
 	HealthCheckMinutes   int    `json:"health_check_minutes"`   // periodic login test interval, 0 = off
 	LogRetentionDays     int    `json:"log_retention_days"`     // message log retention, 0 = keep forever
 	SendTimeoutSec       int    `json:"send_timeout_sec"`       // SMTP timeout per attempt
+
+	// login protection (SMTP AUTH and the admin console)
+	AuthMaxFails   int `json:"auth_max_fails"`   // failed logins from one IP within 15 minutes before it is banned, 0 = off
+	AuthBanMinutes int `json:"auth_ban_minutes"` // ban length
+
+	// bounce suppression
+	SuppressBounces bool `json:"suppress_bounces"` // block recipients that permanently bounced
+	SuppressDays    int  `json:"suppress_days"`    // how long an automatic entry lasts, 0 = forever
+
+	// alerts
+	AlertChannel     string `json:"alert_channel"`       // "" (off) | webhook | wecom | dingtalk | feishu | telegram
+	AlertURL         string `json:"alert_url"`           // webhook / bot URL
+	AlertTGToken     string `json:"alert_tg_token"`      // telegram bot token
+	AlertTGChat      string `json:"alert_tg_chat"`       // telegram chat id
+	AlertFailRatePct int    `json:"alert_fail_rate_pct"` // alert when the 15-minute failure rate exceeds this, 0 = off
 }
 
 func DefaultSettings() Settings {
@@ -32,6 +50,11 @@ func DefaultSettings() Settings {
 		HealthCheckMinutes:   30,
 		LogRetentionDays:     90,
 		SendTimeoutSec:       20,
+		AuthMaxFails:         5,
+		AuthBanMinutes:       60,
+		SuppressBounces:      true,
+		SuppressDays:         180,
+		AlertFailRatePct:     50,
 	}
 }
 
@@ -53,8 +76,25 @@ func (s Settings) Validate() error {
 	if s.SendTimeoutSec < 3 || s.SendTimeoutSec > 120 {
 		return errors.New("send_timeout_sec must be 3-120")
 	}
-	if s.RecipientIntervalSec < 0 || s.RecipientDailyMax < 0 || s.HealthCheckMinutes < 0 || s.LogRetentionDays < 0 {
+	if s.RecipientIntervalSec < 0 || s.RecipientDailyMax < 0 || s.HealthCheckMinutes < 0 || s.LogRetentionDays < 0 ||
+		s.AuthMaxFails < 0 || s.SuppressDays < 0 || s.AlertFailRatePct < 0 || s.AlertFailRatePct > 100 {
 		return errors.New("values must not be negative")
+	}
+	if s.AuthMaxFails > 0 && s.AuthBanMinutes < 1 {
+		return errors.New("auth_ban_minutes must be >= 1")
+	}
+	switch s.AlertChannel {
+	case "":
+	case "webhook", "wecom", "dingtalk", "feishu":
+		if !validHTTPURL(s.AlertURL) {
+			return errors.New("告警地址必须是 http(s):// 开头的 URL")
+		}
+	case "telegram":
+		if !tgToken.MatchString(s.AlertTGToken) || strings.TrimSpace(s.AlertTGChat) == "" {
+			return errors.New("Telegram 需要填写有效的 Bot Token（形如 123456:ABC-xyz）和 Chat ID")
+		}
+	default:
+		return errors.New("alert_channel 无效")
 	}
 	return nil
 }
@@ -93,4 +133,11 @@ func (s *SettingsStore) Set(v Settings) error {
 	s.cur = v
 	s.mu.Unlock()
 	return nil
+}
+
+var tgToken = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
+
+func validHTTPURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }

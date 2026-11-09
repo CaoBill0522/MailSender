@@ -43,8 +43,12 @@ func main() {
 		log.Printf(" 请登录后台后立即修改密码")
 		log.Printf("==================================================")
 	}
-	if err := core.SeedDefaults(db); err != nil {
-		log.Fatalf("seed: %v", err)
+
+	if cfg.Disable2FA {
+		if err := server.Disable2FA(db); err != nil {
+			log.Fatalf("disable 2FA: %v", err)
+		}
+		log.Printf("两步验证已关闭（MS_DISABLE_2FA）。登录后请重新设置，并去掉该环境变量")
 	}
 
 	tp, err := tlsutil.New(tlsutil.Options{CertFile: cfg.TLSCert, KeyFile: cfg.TLSKey, Domains: cfg.TLSDomains, ACMEEmail: cfg.ACMEEmail, DataDir: cfg.DataDir})
@@ -57,11 +61,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("scheduler: %v", err)
 	}
-	svc := core.NewService(db, sched, settings)
+	svc := core.NewService(db, sched, settings, box)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	svc.Start(ctx, 4)
+	svc.Start(ctx)
 
 	info := &server.RuntimeInfo{TLSMode: "none", HTTPListen: cfg.Listen}
 	if tp != nil {

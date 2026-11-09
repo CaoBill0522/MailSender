@@ -33,12 +33,16 @@
             <n-descriptions-item label="状态"><status-tag :s="detail.message.status" /></n-descriptions-item>
             <n-descriptions-item label="收件人">{{ detail.message.to }}</n-descriptions-item>
             <n-descriptions-item label="主题">{{ detail.message.subject }}</n-descriptions-item>
-            <n-descriptions-item label="模板">{{ detail.message.template || '-' }}</n-descriptions-item>
             <n-descriptions-item label="发件地址">{{ detail.message.from_addr || '-' }}</n-descriptions-item>
-            <n-descriptions-item label="调用方">{{ detail.message.api_key_name }}（{{ detail.message.client_ip }}，{{ detail.message.source === 'smtp' ? 'SMTP' : 'HTTP API' }}）</n-descriptions-item>
+            <n-descriptions-item label="调用方">{{ detail.message.api_key_name }}（{{ detail.message.client_ip }}）</n-descriptions-item>
             <n-descriptions-item label="创建时间">{{ fmtTime(detail.message.created_at, true) }}</n-descriptions-item>
             <n-descriptions-item label="发送时间">{{ fmtTime(detail.message.sent_at, true) }}</n-descriptions-item>
             <n-descriptions-item label="总耗时">{{ detail.message.duration_ms }} ms</n-descriptions-item>
+            <n-descriptions-item v-if="detail.message.ref" label="客户端引用"><span class="mono">{{ detail.message.ref }}</span></n-descriptions-item>
+            <n-descriptions-item v-if="detail.message.msg_id" label="Message-ID"><span class="mono" style="word-break: break-all">{{ detail.message.msg_id }}</span></n-descriptions-item>
+            <n-descriptions-item v-if="detail.message.callback" label="投递回调">
+              <span :style="detail.message.callback === 'ok' ? '' : 'color:#d03b3b'">{{ detail.message.callback === 'ok' ? '✓ 已送达' : detail.message.callback }}</span>
+            </n-descriptions-item>
             <n-descriptions-item v-if="detail.message.error" label="错误"><span style="word-break: break-all">{{ detail.message.error }}</span></n-descriptions-item>
           </n-descriptions>
           <h4 style="margin: 20px 0 8px">尝试记录（{{ detail.attempts.length }}）</h4>
@@ -100,7 +104,6 @@ const columns = [
   { title: '尝试', key: 'attempts', width: 60 },
   { title: '耗时', key: 'duration_ms', width: 80, render: (m) => `${m.duration_ms} ms` },
   { title: '调用方', key: 'api_key_name', width: 120, ellipsis: { tooltip: true } },
-  { title: '来源', key: 'source', width: 70, render: (m) => h(NTag, { size: 'small', bordered: false }, () => (m.source === 'smtp' ? 'SMTP' : 'API')) },
   { title: '错误', key: 'error', minWidth: 160, ellipsis: { tooltip: { style: { maxWidth: '520px' } } } },
   { title: '', key: 'op', width: 70, fixed: 'right', render: (m) => h(NButton, { size: 'tiny', text: true, type: 'primary', onClick: () => open(m) }, () => '详情') },
 ]

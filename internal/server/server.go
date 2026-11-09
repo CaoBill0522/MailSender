@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -35,18 +34,18 @@ func (s *Server) Handler(trustedProxies []string) http.Handler {
 	r.Use(gin.Recovery())
 	_ = r.SetTrustedProxies(trustedProxies)
 
-	// Public send API for client programs.
-	api := r.Group("/api/v1", s.apiKeyAuth)
-	api.POST("/send", s.handleSend)
-	api.POST("/send/code", s.handleSendCode)
-	api.GET("/messages/:id", s.handleGetMessage)
-
 	// Admin API for the web console.
 	ad := r.Group("/admin/api")
 	ad.POST("/login", s.handleLogin)
 	ad.Use(s.adminRequired)
 	ad.GET("/me", func(c *gin.Context) { c.JSON(200, gin.H{"username": c.GetString("admin")}) })
 	ad.POST("/password", s.handleChangePassword)
+	ad.GET("/2fa", s.get2FA)
+	ad.POST("/2fa/setup", s.setup2FA)
+	ad.POST("/2fa/enable", s.enable2FA)
+	ad.POST("/2fa/disable", s.disable2FA)
+	ad.GET("/security/bans", func(c *gin.Context) { c.JSON(200, s.svc.Guard.List()) })
+	ad.POST("/security/unban", s.unban)
 
 	ad.GET("/accounts", s.listAccounts)
 	ad.POST("/accounts", s.createAccount)
@@ -56,17 +55,18 @@ func (s *Server) Handler(trustedProxies []string) http.Handler {
 	ad.POST("/accounts/:id/test-send", s.testSendAccount)
 	ad.POST("/accounts/:id/reset", s.resetAccount)
 	ad.POST("/accounts/check-all", s.checkAllAccounts)
+	ad.GET("/groups", s.listGroups)
 
 	ad.GET("/keys", s.listKeys)
 	ad.POST("/keys", s.createKey)
 	ad.PUT("/keys/:id", s.updateKey)
 	ad.DELETE("/keys/:id", s.deleteKey)
+	ad.POST("/keys/:id/callback-secret", s.rotateCallbackSecret)
+	ad.POST("/keys/:id/callback-test", s.testCallback)
 
-	ad.GET("/templates", s.listTemplates)
-	ad.POST("/templates", s.createTemplate)
-	ad.PUT("/templates/:id", s.updateTemplate)
-	ad.DELETE("/templates/:id", s.deleteTemplate)
-	ad.POST("/templates/preview", s.previewTemplate)
+	ad.GET("/suppressions", s.listSuppressions)
+	ad.POST("/suppressions", s.addSuppression)
+	ad.DELETE("/suppressions/:id", s.deleteSuppression)
 
 	ad.GET("/messages", s.listMessages)
 	ad.GET("/messages/:id", s.getMessage)
@@ -79,6 +79,7 @@ func (s *Server) Handler(trustedProxies []string) http.Handler {
 	ad.GET("/settings", s.getSettings)
 	ad.GET("/server-info", func(c *gin.Context) { c.JSON(200, s.info) })
 	ad.PUT("/settings", s.putSettings)
+	ad.POST("/alerts/test", s.testAlert)
 
 	r.NoRoute(s.serveSPA)
 	return r
@@ -87,7 +88,11 @@ func (s *Server) Handler(trustedProxies []string) http.Handler {
 // serveSPA serves the embedded Vue build, falling back to index.html for client-side routes.
 func (s *Server) serveSPA(c *gin.Context) {
 	p := strings.TrimPrefix(c.Request.URL.Path, "/")
-	if strings.HasPrefix(p, "api/") || strings.HasPrefix(p, "admin/api/") {
+	if strings.HasPrefix(p, "api/") {
+		c.JSON(410, gin.H{"code": "gone", "message": "the HTTP send API has been removed; send mail over SMTP with your API key as the password"})
+		return
+	}
+	if strings.HasPrefix(p, "admin/api/") {
 		c.JSON(404, gin.H{"code": "not_found", "message": "not found"})
 		return
 	}
@@ -110,11 +115,6 @@ func (s *Server) serveSPA(c *gin.Context) {
 }
 
 func fail(c *gin.Context, err error) {
-	var ae *core.APIError
-	if errors.As(err, &ae) {
-		c.AbortWithStatusJSON(ae.Status, ae)
-		return
-	}
 	c.AbortWithStatusJSON(500, gin.H{"code": "internal", "message": err.Error()})
 }
 
@@ -122,30 +122,12 @@ func bad(c *gin.Context, msg string) {
 	c.AbortWithStatusJSON(400, gin.H{"code": "bad_request", "message": msg})
 }
 
-// ---------- API key auth ----------
-
 func bearer(c *gin.Context) string {
-	if k := c.GetHeader("X-API-Key"); k != "" {
-		return k
-	}
 	h := c.GetHeader("Authorization")
 	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
 		return strings.TrimSpace(h[7:])
 	}
 	return ""
-}
-
-func (s *Server) apiKeyAuth(c *gin.Context) {
-	k, aerr := s.svc.AuthKey(bearer(c), c.ClientIP())
-	if aerr == nil {
-		aerr = s.svc.AllowKeyRate(k)
-	}
-	if aerr != nil {
-		c.AbortWithStatusJSON(aerr.Status, aerr)
-		return
-	}
-	c.Set("apikey", k)
-	c.Next()
 }
 
 // ---------- admin auth ----------
@@ -156,9 +138,12 @@ type adminAuth struct {
 }
 
 const (
-	keyAdminUser = "admin_user"
-	keyAdminHash = "admin_password_hash"
-	tokenTTL     = 7 * 24 * time.Hour
+	keyAdminUser    = "admin_user"
+	keyAdminHash    = "admin_password_hash"
+	keyTOTP         = "admin_totp"         // encrypted secret, present = 2FA on
+	keyTOTPPending  = "admin_totp_pending" // encrypted secret awaiting its first code
+	keyTOTPLastStep = "admin_totp_last"    // last accepted time step (replay protection)
+	tokenTTL        = 7 * 24 * time.Hour
 )
 
 // EnsureAdmin creates the admin account on first run. Returns the generated password if one was made.
@@ -181,11 +166,14 @@ func EnsureAdmin(db *store.Store, initial string) (string, error) {
 	return generated, db.SetSetting(keyAdminHash, string(h))
 }
 
-// version ties tokens to the current password hash so changing it logs everyone out.
+// version ties tokens to the current password hash and 2FA state, so changing either logs everyone out.
 func (a *adminAuth) version() string {
 	h, _ := a.db.GetSetting(keyAdminHash)
 	if len(h) > 12 {
-		return h[len(h)-12:]
+		h = h[len(h)-12:]
+	}
+	if t, ok := a.db.GetSetting(keyTOTP); ok && t != "" {
+		h += "." + secure.HashAPIKey(t)[:8]
 	}
 	return h
 }
@@ -194,18 +182,46 @@ func (s *Server) handleLogin(c *gin.Context) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		OTP      string `json:"otp"`
 	}
 	if c.ShouldBindJSON(&req) != nil {
 		bad(c, "invalid body")
 		return
 	}
+	ip := c.ClientIP()
+	banned := func(until time.Time) {
+		c.AbortWithStatusJSON(429, gin.H{"code": "banned", "message": "登录失败次数过多，该 IP 已被封禁到 " + until.Format("15:04")})
+	}
+	if until, ok := s.svc.Guard.Banned("admin", ip); ok {
+		banned(until)
+		return
+	}
+	failed := func(msg string) {
+		time.Sleep(500 * time.Millisecond) // slow down guessing
+		if s.svc.Guard.Fail("admin", ip, msg) {
+			until, _ := s.svc.Guard.Banned("admin", ip)
+			banned(until)
+			return
+		}
+		c.AbortWithStatusJSON(401, gin.H{"code": "unauthorized", "message": msg})
+	}
 	user, _ := s.db.GetSetting(keyAdminUser)
 	hash, _ := s.db.GetSetting(keyAdminHash)
 	if req.Username != user || bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
-		time.Sleep(500 * time.Millisecond) // slow down guessing
-		c.AbortWithStatusJSON(401, gin.H{"code": "unauthorized", "message": "用户名或密码错误"})
+		failed("用户名或密码错误")
 		return
 	}
+	if secret, on := s.totpSecret(keyTOTP); on {
+		if strings.TrimSpace(req.OTP) == "" {
+			c.AbortWithStatusJSON(401, gin.H{"code": "otp_required", "message": "请输入两步验证码"})
+			return
+		}
+		if !s.checkTOTP(secret, req.OTP) {
+			failed("两步验证码错误")
+			return
+		}
+	}
+	s.svc.Guard.Success("admin", ip)
 	c.JSON(200, gin.H{"token": s.box.SignToken(user, s.auth.version(), tokenTTL), "username": user})
 }
 

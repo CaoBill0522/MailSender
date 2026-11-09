@@ -1,18 +1,14 @@
 package core
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	htmltpl "html/template"
 	"log"
 	"net"
 	netmail "net/mail"
 	"strings"
 	"sync"
-	texttpl "text/template"
 	"time"
 
 	"gorm.io/gorm"
@@ -22,122 +18,61 @@ import (
 	"mailsender/internal/store"
 )
 
-// APIError is returned to API clients with an HTTP status.
-type APIError struct {
-	Status int    `json:"-"`
-	Code   string `json:"code"`
-	Msg    string `json:"message"`
-}
-
-func (e *APIError) Error() string { return e.Msg }
-
-func apiErr(status int, code, format string, a ...any) *APIError {
-	return &APIError{Status: status, Code: code, Msg: fmt.Sprintf(format, a...)}
-}
-
-type SendRequest struct {
-	To       string         `json:"to"`
-	Subject  string         `json:"subject"`
-	HTML     string         `json:"html"`
-	Text     string         `json:"text"`
-	Template string         `json:"template"`
-	Vars     map[string]any `json:"vars"`
-	FromName string         `json:"from_name"`
-	Async    bool           `json:"async"`
-
-	secret string // value masked out of the stored subject (verification code)
-}
-
-type CodeRequest struct {
-	To       string         `json:"to"`
-	Code     string         `json:"code"`     // optional; generated when empty
-	Length   int            `json:"length"`   // generated code length, default 6
-	Minutes  int            `json:"minutes"`  // validity shown in the mail, default 10
-	Template string         `json:"template"` // default "verify_code"
-	Vars     map[string]any `json:"vars"`
-	FromName string         `json:"from_name"`
-	Async    bool           `json:"async"`
-}
-
+// Service relays mail received by the SMTP ingress through the account pool.
 type Service struct {
-	DB    *store.Store
-	Sched *Scheduler
-	Cfg   *SettingsStore
-	rcpt  *RecipientLimiter
-	Keys  *KeyLimiter
+	DB     *store.Store
+	Sched  *Scheduler
+	Cfg    *SettingsStore
+	Box    *secure.Box
+	Guard  *AuthGuard
+	Notify *Notifier
+	rcpt   *RecipientLimiter
+	Keys   *KeyLimiter
+	hooks  *callbacks
 
-	queue    chan uint
-	inflight sync.Map // message id -> struct{}
 	keyTouch sync.Map // api key id -> last time last_used_at was persisted
 }
 
-const DefaultCodeTemplate = "verify_code"
-
-func NewService(db *store.Store, sched *Scheduler, cfg *SettingsStore) *Service {
-	return &Service{
-		DB: db, Sched: sched, Cfg: cfg,
-		rcpt:  NewRecipientLimiter(),
-		Keys:  NewKeyLimiter(),
-		queue: make(chan uint, 10000),
+func NewService(db *store.Store, sched *Scheduler, cfg *SettingsStore, box *secure.Box) *Service {
+	s := &Service{DB: db, Sched: sched, Cfg: cfg, Box: box, Guard: NewAuthGuard(cfg), Notify: NewNotifier(cfg),
+		rcpt: NewRecipientLimiter(), Keys: NewKeyLimiter()}
+	s.hooks = newCallbacks(s)
+	sched.OnCooldown = func(a store.Account, until time.Time) {
+		s.Notify.Notify(fmt.Sprintf("cool:%d", a.ID), 30*time.Minute, Alert{
+			Event: "account_cooldown", Title: "账号进入冷却：" + a.Name,
+			Text: fmt.Sprintf("%s <%s> 连续失败 %d 次，暂停使用到 %s。\n最近错误：%s", a.Name, a.FromAddr, a.ConsecutiveFails, until.Format("15:04"), a.LastError),
+			Data: map[string]any{"account_id": a.ID, "account": a.Name, "from": a.FromAddr, "until": until, "error": a.LastError},
+		})
 	}
+	sched.OnRecover = func(a store.Account) {
+		s.Notify.Notify(fmt.Sprintf("recover:%d", a.ID), 30*time.Minute, Alert{
+			Event: "account_recovered", Title: "账号已恢复：" + a.Name,
+			Text: fmt.Sprintf("%s <%s> 冷却后已成功发信，恢复正常轮询。", a.Name, a.FromAddr),
+			Data: map[string]any{"account_id": a.ID, "account": a.Name, "from": a.FromAddr},
+		})
+	}
+	s.Guard.OnBan = func(scope, ip string, fails int, until time.Time) {
+		where := map[string]string{"smtp": "SMTP 登录", "admin": "后台登录"}[scope]
+		log.Printf("banned %s on %s after %d failed logins until %s", ip, scope, fails, until.Format(time.DateTime))
+		s.Notify.Notify("ban:"+scope, 30*time.Minute, Alert{
+			Event: "ip_banned", Title: "IP 已封禁：" + ip,
+			Text: fmt.Sprintf("%s 在 15 分钟内%s失败 %d 次，封禁到 %s。30 分钟内的其他封禁不再单独提醒，可在后台「安全」页查看。", ip, where, fails, until.Format("15:04")),
+			Data: map[string]any{"scope": scope, "ip": ip, "fails": fails, "until": until},
+		})
+	}
+	return s
 }
 
-// Start launches async workers and background jobs.
-func (s *Service) Start(ctx context.Context, workers int) {
-	for i := 0; i < workers; i++ {
-		go s.worker(ctx)
+// Start runs background jobs (health checks, log cleanup, limiter GC, failure-rate alerts).
+func (s *Service) Start(ctx context.Context) {
+	// Delivery is synchronous, so anything still queued was interrupted by a restart. The SMTP client
+	// never got a success reply and will retry, so mark these failed instead of sending duplicates.
+	res := s.DB.DB.Model(&store.Message{}).Where("status = ?", store.StatusQueued).
+		Updates(map[string]any{"status": store.StatusFailed, "error": "interrupted by service restart (client was not told it succeeded)"})
+	if res.RowsAffected > 0 {
+		log.Printf("marked %d interrupted messages as failed", res.RowsAffected)
 	}
-	go s.sweeper(ctx)
 	go s.maintenance(ctx)
-}
-
-func (s *Service) worker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case id := <-s.queue:
-			var m store.Message
-			if err := s.DB.DB.First(&m, id).Error; err == nil && m.Status == store.StatusQueued {
-				s.deliver(&m, true)
-			}
-			s.inflight.Delete(id)
-		}
-	}
-}
-
-func (s *Service) enqueue(id uint) bool {
-	if _, loaded := s.inflight.LoadOrStore(id, struct{}{}); loaded {
-		return true
-	}
-	select {
-	case s.queue <- id:
-		return true
-	default:
-		s.inflight.Delete(id)
-		return false // stays queued in DB; the sweeper retries
-	}
-}
-
-// sweeper re-enqueues queued messages left over from a restart or a full queue.
-func (s *Service) sweeper(ctx context.Context) {
-	t := time.NewTicker(30 * time.Second)
-	defer t.Stop()
-	for {
-		var ids []uint
-		s.DB.DB.Model(&store.Message{}).Where("status = ? AND created_at < ?", store.StatusQueued, time.Now().Add(-20*time.Second)).
-			Order("id").Limit(1000).Pluck("id", &ids)
-		for _, id := range ids {
-			if !s.enqueue(id) {
-				break
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-	}
 }
 
 func (s *Service) maintenance(ctx context.Context) {
@@ -152,6 +87,8 @@ func (s *Service) maintenance(ctx context.Context) {
 		}
 		set := s.Cfg.Get()
 		s.rcpt.GC(time.Duration(set.RecipientIntervalSec) * time.Second)
+		s.Guard.GC()
+		s.checkFailureRate(set)
 		if set.HealthCheckMinutes > 0 && time.Since(lastCheck) >= time.Duration(set.HealthCheckMinutes)*time.Minute {
 			lastCheck = time.Now()
 			s.HealthCheckAll()
@@ -163,8 +100,29 @@ func (s *Service) maintenance(ctx context.Context) {
 			} else if n > 0 {
 				log.Printf("cleanup: removed %d old messages", n)
 			}
+			s.DB.DB.Where("expires_at IS NOT NULL AND expires_at < ?", time.Now()).Delete(&store.Suppression{})
 		}
 	}
+}
+
+// checkFailureRate alerts when most recent messages fail (at least 10 in the last 15 minutes).
+func (s *Service) checkFailureRate(set Settings) {
+	if set.AlertChannel == "" || set.AlertFailRatePct <= 0 {
+		return
+	}
+	var r struct{ Total, Failed int64 }
+	s.DB.DB.Model(&store.Message{}).Select("COUNT(*) AS total, SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed", store.StatusFailed).
+		Where("created_at >= ? AND status <> ?", time.Now().Add(-15*time.Minute), store.StatusQueued).Scan(&r)
+	if r.Total < 10 || r.Failed*100 < r.Total*int64(set.AlertFailRatePct) {
+		return
+	}
+	var last store.Message
+	s.DB.DB.Where("status = ?", store.StatusFailed).Order("id DESC").First(&last)
+	s.Notify.Notify("failrate", time.Hour, Alert{
+		Event: "high_failure_rate", Title: fmt.Sprintf("失败率过高：%d%%", r.Failed*100/r.Total),
+		Text: fmt.Sprintf("最近 15 分钟 %d 封中失败 %d 封。\n最近一次错误：%s", r.Total, r.Failed, trimText(last.Error, 300)),
+		Data: map[string]any{"total": r.Total, "failed": r.Failed, "last_error": last.Error},
+	})
 }
 
 // HealthCheckAll login-tests every enabled account (max 4 at a time).
@@ -219,158 +177,80 @@ func (s *Service) TestSend(id uint, to string) error {
 	}, timeout)
 }
 
-// Render builds mail content from a template or raw fields.
-func (s *Service) Render(req SendRequest) (mailer.Content, string, error) {
-	c := mailer.Content{FromName: req.FromName, Subject: req.Subject, HTML: req.HTML, Text: req.Text}
-	if req.Template == "" {
-		if strings.TrimSpace(c.Subject) == "" {
-			return c, "", apiErr(400, "bad_request", "subject is required")
-		}
-		if c.HTML == "" && c.Text == "" {
-			return c, "", apiErr(400, "bad_request", "html or text is required")
-		}
-		return c, "", nil
-	}
-	var t store.Template
-	if err := s.DB.DB.Where("name = ?", req.Template).First(&t).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return c, "", apiErr(400, "template_not_found", "template %q not found", req.Template)
-		}
-		return c, "", err
-	}
-	return RenderTemplate(t, req.Vars, req.FromName)
-}
+// ErrSuppressed means the recipient is on the suppression list (permanent).
+var ErrSuppressed = errors.New("recipient is on the suppression list")
 
-// RenderTemplate executes a template with vars. Subject/text use text/template, HTML is auto-escaped.
-func RenderTemplate(t store.Template, vars map[string]any, fromName string) (mailer.Content, string, error) {
-	if vars == nil {
-		vars = map[string]any{}
+// CheckRecipient rejects suppressed addresses, then applies the per-recipient frequency limits and reserves a slot.
+func (s *Service) CheckRecipient(key *store.APIKey, to string) error {
+	if sup, ok := s.Suppressed(to); ok {
+		s.DB.DB.Model(&store.Suppression{}).Where("id = ?", sup.ID).UpdateColumn("hits", gorm.Expr("hits + 1"))
+		_ = s.DB.IncStat(store.Day(time.Now()), key.ID, 0, store.DailyStat{MsgRejected: 1})
+		return fmt.Errorf("%w (%s)", ErrSuppressed, trimText(sup.Reason, 120))
 	}
-	c := mailer.Content{FromName: fromName}
-	var err error
-	if c.Subject, err = execText(t.Subject, vars); err != nil {
-		return c, t.Name, apiErr(400, "template_error", "subject: %v", err)
-	}
-	if c.Text, err = execText(t.Text, vars); err != nil {
-		return c, t.Name, apiErr(400, "template_error", "text: %v", err)
-	}
-	if t.HTML != "" {
-		tp, err := htmltpl.New("h").Option("missingkey=zero").Parse(t.HTML)
-		if err != nil {
-			return c, t.Name, apiErr(400, "template_error", "html: %v", err)
-		}
-		var b bytes.Buffer
-		if err := tp.Execute(&b, vars); err != nil {
-			return c, t.Name, apiErr(400, "template_error", "html: %v", err)
-		}
-		c.HTML = b.String()
-	}
-	return c, t.Name, nil
-}
-
-func execText(src string, vars map[string]any) (string, error) {
-	if src == "" {
-		return "", nil
-	}
-	tp, err := texttpl.New("t").Option("missingkey=zero").Parse(src)
-	if err != nil {
-		return "", err
-	}
-	var b bytes.Buffer
-	if err := tp.Execute(&b, vars); err != nil {
-		return "", err
-	}
-	return strings.ReplaceAll(b.String(), "<no value>", ""), nil
-}
-
-// Submit validates, rate-limits and records a send request, then delivers it (sync) or queues it (async).
-func (s *Service) Submit(key *store.APIKey, clientIP string, req SendRequest) (*store.Message, error) {
-	addr, err := netmail.ParseAddress(strings.TrimSpace(req.To))
-	if err != nil || strings.ContainsAny(req.To, ",;") {
-		return nil, apiErr(400, "bad_request", "to must be a single valid email address")
-	}
-	req.To = addr.Address
-
-	content, tplName, err := s.Render(req)
-	if err != nil {
-		return nil, err
-	}
-	content.To = req.To
-	if strings.TrimSpace(content.Subject) == "" {
-		return nil, apiErr(400, "bad_request", "rendered subject is empty")
-	}
-
-	if err := s.CheckRecipient(key, req.To); err != nil {
-		return nil, err
-	}
-
-	logSubject := content.Subject
-	if req.secret != "" {
-		logSubject = strings.ReplaceAll(logSubject, req.secret, strings.Repeat("*", len(req.secret)))
-	}
-	m, err := s.record(key, clientIP, "api", req.To, logSubject, tplName, content)
-	if err != nil {
-		return nil, err
-	}
-	if req.Async {
-		s.enqueue(m.ID)
-		return m, nil
-	}
-	s.inflight.Store(m.ID, struct{}{})
-	defer s.inflight.Delete(m.ID)
-	s.deliver(m, false)
-	return m, nil
-}
-
-// CheckRecipient applies the per-recipient frequency limits and reserves a slot.
-func (s *Service) CheckRecipient(key *store.APIKey, to string) *APIError {
 	set := s.Cfg.Get()
 	if ok, wait := s.rcpt.Allow(to, time.Duration(set.RecipientIntervalSec)*time.Second, set.RecipientDailyMax); !ok {
 		_ = s.DB.IncStat(store.Day(time.Now()), key.ID, 0, store.DailyStat{MsgRejected: 1})
 		if wait < 0 {
-			return apiErr(429, "recipient_daily_limit", "daily limit for this recipient reached")
+			return errors.New("daily limit for this recipient reached")
 		}
-		return apiErr(429, "recipient_too_frequent", "too frequent for this recipient, retry in %ds", int(wait.Seconds())+1)
+		return fmt.Errorf("too frequent for this recipient, retry in %ds", int(wait.Seconds())+1)
 	}
 	return nil
 }
 
-func (s *Service) record(key *store.APIKey, clientIP, source, to, subject, tplName string, content mailer.Content) (*store.Message, error) {
-	payload, err := json.Marshal(content)
-	if err != nil {
-		return nil, err
-	}
-	m := &store.Message{
-		APIKeyID: key.ID, APIKeyName: key.Name, Source: source,
-		To: to, Subject: subject, Template: tplName,
-		Status: store.StatusQueued, ClientIP: clientIP, Payload: string(payload),
-	}
-	return m, s.DB.DB.Create(m).Error
+// Suppressed returns the active suppression entry for addr, if any.
+func (s *Service) Suppressed(addr string) (*store.Suppression, bool) {
+	var sup store.Suppression
+	err := s.DB.DB.Where("addr = ? AND (expires_at IS NULL OR expires_at > ?)", strings.ToLower(strings.TrimSpace(addr)), time.Now()).
+		Limit(1).Find(&sup).Error
+	return &sup, err == nil && sup.ID != 0
 }
 
-// SubmitRaw relays a message received over SMTP to each recipient (one tracked message per recipient)
+// Suppress adds (or refreshes) a suppression entry. days <= 0 means forever.
+func (s *Service) Suppress(addr, reason, source string, msgID uint, days int) error {
+	sup := store.Suppression{Addr: strings.ToLower(strings.TrimSpace(addr)), Reason: trimText(reason, 500), Source: source, MessageID: msgID}
+	if days > 0 {
+		t := time.Now().AddDate(0, 0, days)
+		sup.ExpiresAt = &t
+	}
+	var old store.Suppression
+	if s.DB.DB.Where("addr = ?", sup.Addr).Limit(1).Find(&old); old.ID != 0 {
+		return s.DB.DB.Model(&old).Select("reason", "source", "message_id", "expires_at", "created_at").
+			Updates(&store.Suppression{Reason: sup.Reason, Source: sup.Source, MessageID: msgID, ExpiresAt: sup.ExpiresAt, CreatedAt: time.Now()}).Error
+	}
+	return s.DB.DB.Create(&sup).Error
+}
+
+// Relay delivers a message received over SMTP to each recipient (one tracked message per recipient)
 // and waits for the results. Recipient limits must already have been checked at RCPT time.
-func (s *Service) SubmitRaw(key *store.APIKey, clientIP string, rcpts []string, raw []byte) ([]*store.Message, error) {
-	subject := mailer.SubjectOf(raw)
+func (s *Service) Relay(key *store.APIKey, clientIP string, rcpts []string, raw []byte) ([]*store.Message, error) {
+	meta := mailer.MetaOf(raw)
 	msgs := make([]*store.Message, len(rcpts))
 	for i, to := range rcpts {
-		m, err := s.record(key, clientIP, "smtp", to, subject, "", mailer.Content{To: to, Subject: subject, Raw: raw})
-		if err != nil {
+		m := &store.Message{
+			APIKeyID: key.ID, APIKeyName: key.Name, Source: "smtp",
+			To: to, Subject: meta.Subject, Status: store.StatusQueued, ClientIP: clientIP, Ref: meta.Ref, MsgID: meta.MsgID,
+		}
+		if err := s.DB.DB.Create(m).Error; err != nil {
 			return nil, err
 		}
 		msgs[i] = m
 	}
+	groups := SplitList(key.Groups)
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for _, m := range msgs {
 		wg.Add(1)
 		sem <- struct{}{}
-		s.inflight.Store(m.ID, struct{}{})
 		go func(m *store.Message) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			defer s.inflight.Delete(m.ID)
-			s.deliver(m, false)
+			c := mailer.Content{To: m.To, Subject: meta.Subject, Raw: raw}
+			if meta.MsgID == "" {
+				c.MsgIDLocal = secure.RandomString(24)
+			}
+			s.deliver(m, c, Route{Groups: groups, Domain: domainOf(m.To)})
+			s.hooks.fire(key, m)
 		}(m)
 	}
 	wg.Wait()
@@ -378,16 +258,16 @@ func (s *Service) SubmitRaw(key *store.APIKey, clientIP string, rcpts []string, 
 }
 
 // AuthKey resolves a plaintext API key and checks that it is enabled and allowed from clientIP.
-func (s *Service) AuthKey(raw, clientIP string) (*store.APIKey, *APIError) {
+func (s *Service) AuthKey(raw, clientIP string) (*store.APIKey, error) {
 	if raw == "" {
-		return nil, apiErr(401, "unauthorized", "missing API key")
+		return nil, errors.New("missing API key")
 	}
 	var k store.APIKey
 	if err := s.DB.DB.Where("key_hash = ?", secure.HashAPIKey(raw)).First(&k).Error; err != nil || !k.Enabled {
-		return nil, apiErr(401, "unauthorized", "invalid or disabled API key")
+		return nil, errors.New("invalid or disabled API key")
 	}
 	if !IPAllowed(k.IPWhitelist, clientIP) {
-		return nil, apiErr(403, "ip_forbidden", "client IP not in whitelist: %s", clientIP)
+		return nil, fmt.Errorf("client IP not in whitelist: %s", clientIP)
 	}
 	now := time.Now()
 	if v, ok := s.keyTouch.Load(k.ID); !ok || now.Sub(v.(time.Time)) > time.Minute {
@@ -397,10 +277,10 @@ func (s *Service) AuthKey(raw, clientIP string) (*store.APIKey, *APIError) {
 	return &k, nil
 }
 
-// AllowKeyRate applies the key's requests-per-minute limit.
-func (s *Service) AllowKeyRate(k *store.APIKey) *APIError {
+// AllowKeyRate applies the key's mails-per-minute limit.
+func (s *Service) AllowKeyRate(k *store.APIKey) error {
 	if !s.Keys.Allow(k.ID, k.RateLimitPerMin) {
-		return apiErr(429, "key_rate_limited", "API key rate limit exceeded")
+		return errors.New("API key rate limit exceeded")
 	}
 	return nil
 }
@@ -424,47 +304,8 @@ func IPAllowed(list, ip string) bool {
 	return false
 }
 
-// SendCode is a convenience wrapper for verification-code mails.
-func (s *Service) SendCode(key *store.APIKey, clientIP string, req CodeRequest) (*store.Message, string, error) {
-	code := strings.TrimSpace(req.Code)
-	if code == "" {
-		n := req.Length
-		if n <= 0 {
-			n = 6
-		}
-		if n > 12 {
-			n = 12
-		}
-		code = secure.RandomDigits(n)
-	}
-	minutes := req.Minutes
-	if minutes <= 0 {
-		minutes = 10
-	}
-	vars := map[string]any{}
-	for k, v := range req.Vars {
-		vars[k] = v
-	}
-	vars["code"], vars["minutes"], vars["email"] = code, minutes, req.To
-	tpl := req.Template
-	if tpl == "" {
-		tpl = DefaultCodeTemplate
-	}
-	m, err := s.Submit(key, clientIP, SendRequest{To: req.To, Template: tpl, Vars: vars, FromName: req.FromName, Async: req.Async, secret: code})
-	return m, code, err
-}
-
-// MaxQueueWait is how long an async message may wait for a free account before it is failed.
-const MaxQueueWait = 30 * time.Minute
-
 // deliver tries up to MaxAttempts different accounts until one succeeds.
-// With canDefer, a message that finds every account busy (quota/cooldown) stays queued for the sweeper.
-func (s *Service) deliver(m *store.Message, canDefer bool) {
-	var c mailer.Content
-	if err := json.Unmarshal([]byte(m.Payload), &c); err != nil {
-		s.finish(m, false, "corrupt payload: "+err.Error(), 0, "", time.Now())
-		return
-	}
+func (s *Service) deliver(m *store.Message, c mailer.Content, rt Route) {
 	set := s.Cfg.Get()
 	timeout := time.Duration(set.SendTimeoutSec) * time.Second
 	start := time.Now()
@@ -474,14 +315,22 @@ func (s *Service) deliver(m *store.Message, canDefer bool) {
 	var from string
 	ok := false
 	for i := 0; i < set.MaxAttempts; i++ {
-		lease, err := s.Sched.Acquire(exclude)
+		lease, err := s.Sched.Acquire(exclude, rt)
 		if err != nil {
-			if i == 0 && canDefer && time.Since(m.CreatedAt) < MaxQueueWait {
-				s.DB.DB.Model(m).UpdateColumn("error", "waiting: "+err.Error())
-				return
-			}
 			if len(errs) == 0 || !errors.Is(err, ErrNoAccount) || !strings.Contains(err.Error(), "already tried") {
 				errs = append(errs, err.Error())
+			}
+			if i == 0 && errors.Is(err, ErrNoAccount) {
+				title, scope := "没有可用的发件账号", ""
+				if len(rt.Groups) > 0 {
+					scope = strings.Join(rt.Groups, ",")
+					title += "（分组 " + scope + "）"
+				}
+				s.Notify.Notify("pool:"+scope, 30*time.Minute, Alert{
+					Event: "pool_unavailable", Title: title,
+					Text: fmt.Sprintf("发给 %s 的邮件无法发送：%s。\n客户端收到 451，会稍后重试。", m.To, err),
+					Data: map[string]any{"to": m.To, "error": err.Error(), "groups": rt.Groups},
+				})
 			}
 			break
 		}
@@ -509,53 +358,44 @@ func (s *Service) deliver(m *store.Message, canDefer bool) {
 
 		if err == nil {
 			ok = true
+			if m.MsgID == "" {
+				m.MsgID = mailer.MessageID(c.MsgIDLocal, acc.FromAddr)
+			}
 			break
 		}
 		errs = append(errs, fmt.Sprintf("[%s] %s", acc.Name, mailer.Short(err)))
 		if kind == mailer.KindRecipient {
 			m.Permanent = true
+			if set.SuppressBounces {
+				if e := s.Suppress(m.To, mailer.Short(err), "bounce", m.ID, set.SuppressDays); e != nil {
+					log.Printf("suppress %s: %v", m.To, e)
+				}
+			}
 			break
 		}
 	}
-	m.AccountID, m.FromAddr = lastAcc, from
-	errMsg := ""
-	if !ok {
-		errMsg = strings.Join(errs, " | ")
-	}
-	s.finish(m, ok, errMsg, time.Since(start).Milliseconds(), from, start)
-}
 
-func (s *Service) finish(m *store.Message, ok bool, errMsg string, durMs int64, from string, start time.Time) {
 	now := time.Now()
-	m.Status, m.Error, m.DurationMs, m.Payload = store.StatusFailed, errMsg, durMs, ""
+	m.AccountID, m.FromAddr, m.DurationMs = lastAcc, from, now.Sub(start).Milliseconds()
 	st := store.DailyStat{MsgFailed: 1}
 	if ok {
-		m.Status, m.SentAt = store.StatusSent, &now
+		m.Status, m.SentAt, m.Error = store.StatusSent, &now, ""
 		st = store.DailyStat{MsgSent: 1}
+	} else {
+		m.Status, m.Error = store.StatusFailed, strings.Join(errs, " | ")
 	}
-	if err := s.DB.DB.Model(m).Select("account_id", "from_addr", "status", "attempts", "error", "duration_ms", "payload", "sent_at").Updates(m).Error; err != nil {
+	if err := s.DB.DB.Model(m).Select("account_id", "from_addr", "status", "attempts", "error", "duration_ms", "sent_at", "msg_id").Updates(m).Error; err != nil {
 		log.Printf("save message %d: %v", m.ID, err)
 	}
 	_ = s.DB.IncStat(store.Day(start), m.APIKeyID, m.AccountID, st)
 }
 
-// SeedDefaults creates the built-in verification-code template on first run.
-func SeedDefaults(db *store.Store) error {
-	var n int64
-	db.DB.Model(&store.Template{}).Where("name = ?", DefaultCodeTemplate).Count(&n)
-	if n > 0 {
-		return nil
+func domainOf(addr string) string { return strings.ToLower(addr[strings.LastIndex(addr, "@")+1:]) }
+
+func trimText(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return s[:n] + "…"
 	}
-	return db.DB.Create(&store.Template{
-		Name:    DefaultCodeTemplate,
-		Subject: "您的验证码：{{.code}}",
-		Text:    "您的验证码是：{{.code}}\n{{.minutes}} 分钟内有效，请勿泄露给他人。\n如非本人操作，请忽略本邮件。",
-		HTML: `<div style="max-width:480px;margin:0 auto;padding:24px;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#222">
-  <p style="font-size:15px">您好，</p>
-  <p style="font-size:15px">您的验证码是：</p>
-  <p style="font-size:32px;font-weight:700;letter-spacing:6px;margin:16px 0">{{.code}}</p>
-  <p style="font-size:13px;color:#666">{{.minutes}} 分钟内有效，请勿泄露给他人。如非本人操作，请忽略本邮件。</p>
-</div>`,
-		Remark: "内置验证码模板，变量：code、minutes、email",
-	}).Error
+	return s
 }

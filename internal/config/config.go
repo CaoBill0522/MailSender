@@ -12,6 +12,7 @@ type Config struct {
 	DataDir        string
 	Secret         string // master key for encrypting SMTP passwords and signing admin tokens
 	AdminPassword  string // initial admin password (only used when no admin exists yet)
+	Disable2FA     bool   // turn off admin two-factor login at startup (lost authenticator)
 	TrustedProxies []string
 
 	// TLS: either certificate files or automatic Let's Encrypt certificates for the given domains.
@@ -47,6 +48,7 @@ func Load() *Config {
 	flag.Parse()
 	c.Secret = os.Getenv("MS_SECRET")
 	c.AdminPassword = os.Getenv("MS_ADMIN_PASSWORD")
+	c.Disable2FA = os.Getenv("MS_DISABLE_2FA") == "true"
 	c.TrustedProxies = split(*proxies)
 	c.TLSDomains = split(*domains)
 	for _, p := range []*string{&c.SMTPListen, &c.SMTPSListen, &c.HTTPSListen} {

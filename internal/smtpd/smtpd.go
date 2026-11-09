@@ -118,14 +118,22 @@ type backend struct{ svc *core.Service }
 
 func (b *backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	ip, _, _ := net.SplitHostPort(c.Conn().RemoteAddr().String())
+	if until, banned := b.svc.Guard.Banned("smtp", ip); banned {
+		return nil, bannedErr(until)
+	}
 	return &session{svc: b.svc, ip: ip}, nil
 }
 
+func bannedErr(until time.Time) *smtp.SMTPError {
+	return smtpErr(554, smtp.EnhancedCode{5, 7, 1}, "too many failed logins from your IP, blocked until %s", until.Format(time.RFC3339))
+}
+
 type session struct {
-	svc   *core.Service
-	ip    string
-	key   *store.APIKey
-	rcpts []string
+	svc      *core.Service
+	ip       string
+	key      *store.APIKey
+	rcpts    []string
+	failedPW map[string]bool // passwords already counted as failed on this connection
 }
 
 func smtpErr(code int, enh smtp.EnhancedCode, format string, a ...any) *smtp.SMTPError {
@@ -137,21 +145,35 @@ func (s *session) AuthMechanisms() []string { return []string{sasl.Plain, sasl.L
 func (s *session) Auth(mech string) (sasl.Server, error) {
 	// The API key is the password. For clients that put it in the username field instead, accept that too.
 	verify := func(username, password string) error {
+		if until, banned := s.svc.Guard.Banned("smtp", s.ip); banned {
+			return bannedErr(until)
+		}
 		cands := []string{password}
 		if strings.HasPrefix(username, "ms_") {
 			cands = append(cands, username)
 		}
-		var last *core.APIError
+		var last error
 		for _, c := range cands {
 			k, aerr := s.svc.AuthKey(c, s.ip)
 			if aerr == nil {
 				s.key = k
+				s.svc.Guard.Success("smtp", s.ip)
 				return nil
 			}
 			last = aerr
 		}
 		time.Sleep(time.Second) // slow down guessing
-		return smtpErr(535, smtp.EnhancedCode{5, 7, 8}, "authentication failed: %s", last.Msg)
+		// clients such as Python's smtplib retry the same password with every mechanism; count it once
+		if s.failedPW == nil {
+			s.failedPW = map[string]bool{}
+		}
+		counted := s.failedPW[password]
+		s.failedPW[password] = true
+		if !counted && s.svc.Guard.Fail("smtp", s.ip, last.Error()) {
+			until, _ := s.svc.Guard.Banned("smtp", s.ip)
+			return bannedErr(until)
+		}
+		return smtpErr(535, smtp.EnhancedCode{5, 7, 8}, "authentication failed: %s", last)
 	}
 	switch mech {
 	case sasl.Plain:
@@ -166,8 +188,8 @@ func (s *session) Mail(_ string, _ *smtp.MailOptions) error {
 	if s.key == nil {
 		return smtp.ErrAuthRequired
 	}
-	if aerr := s.svc.AllowKeyRate(s.key); aerr != nil {
-		return smtpErr(450, smtp.EnhancedCode{4, 7, 1}, "%s", aerr.Msg)
+	if err := s.svc.AllowKeyRate(s.key); err != nil {
+		return smtpErr(450, smtp.EnhancedCode{4, 7, 1}, "%s", err)
 	}
 	s.rcpts = nil
 	return nil
@@ -184,8 +206,11 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	if len(s.rcpts) >= maxRecipients {
 		return smtpErr(452, smtp.EnhancedCode{4, 5, 3}, "too many recipients")
 	}
-	if aerr := s.svc.CheckRecipient(s.key, a.Address); aerr != nil {
-		return smtpErr(450, smtp.EnhancedCode{4, 2, 1}, "%s", aerr.Msg)
+	if err := s.svc.CheckRecipient(s.key, a.Address); err != nil {
+		if errors.Is(err, core.ErrSuppressed) {
+			return smtpErr(550, smtp.EnhancedCode{5, 1, 1}, "%s", err)
+		}
+		return smtpErr(450, smtp.EnhancedCode{4, 2, 1}, "%s", err)
 	}
 	s.rcpts = append(s.rcpts, a.Address)
 	return nil
@@ -199,7 +224,7 @@ func (s *session) Data(r io.Reader) error {
 	if err != nil {
 		return err // includes smtp.ErrDataTooLarge
 	}
-	msgs, err := s.svc.SubmitRaw(s.key, s.ip, s.rcpts, raw)
+	msgs, err := s.svc.Relay(s.key, s.ip, s.rcpts, raw)
 	if err != nil {
 		log.Printf("smtp ingress: %v", err)
 		return smtpErr(451, smtp.EnhancedCode{4, 3, 0}, "internal error, try again later")

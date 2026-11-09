@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	netmail "net/mail"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,8 @@ type accountInput struct {
 	LimitPerDay    int    `json:"limit_per_day"`
 	Enabled        bool   `json:"enabled"`
 	Remark         string `json:"remark"`
+	Groups         string `json:"groups"`
+	PreferDomains  string `json:"prefer_domains"`
 }
 
 func (in *accountInput) normalize() error {
@@ -108,6 +111,16 @@ func (in *accountInput) normalize() error {
 	if in.LimitPerMinute < 0 || in.LimitPerHour < 0 || in.LimitPerDay < 0 {
 		return errors.New("限额不能为负数")
 	}
+	in.Groups = strings.Join(core.SplitList(in.Groups), ",")
+	doms := core.SplitList(in.PreferDomains)
+	for i, d := range doms {
+		d = strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(d, "@"), "*"), ".")
+		if !strings.Contains(d, ".") || strings.ContainsAny(d, "@/:") {
+			return fmt.Errorf("优先域名无效：%s", doms[i])
+		}
+		doms[i] = d
+	}
+	in.PreferDomains = strings.Join(doms, ",")
 	return nil
 }
 
@@ -116,6 +129,7 @@ func (in *accountInput) apply(a *store.Account) {
 	a.Username, a.FromAddr, a.FromName, a.Weight = in.Username, in.FromAddr, in.FromName, in.Weight
 	a.LimitPerMinute, a.LimitPerHour, a.LimitPerDay = in.LimitPerMinute, in.LimitPerHour, in.LimitPerDay
 	a.Enabled, a.Remark = in.Enabled, in.Remark
+	a.Groups, a.PreferDomains = in.Groups, in.PreferDomains
 }
 
 func (s *Server) listAccounts(c *gin.Context) {
@@ -179,7 +193,7 @@ func (s *Server) updateAccount(c *gin.Context) {
 	}
 	in.apply(&a)
 	cols := []string{"name", "host", "port", "security", "auth_type", "username", "from_addr", "from_name",
-		"weight", "limit_per_minute", "limit_per_hour", "limit_per_day", "enabled", "remark"}
+		"weight", "limit_per_minute", "limit_per_hour", "limit_per_day", "enabled", "remark", "group_tags", "prefer_domains"}
 	if in.Password != "" {
 		enc, err := s.box.Encrypt(in.Password)
 		if err != nil {
@@ -266,7 +280,38 @@ type keyInput struct {
 	Enabled         bool   `json:"enabled"`
 	RateLimitPerMin int    `json:"rate_limit_per_min"`
 	IPWhitelist     string `json:"ip_whitelist"`
+	Groups          string `json:"groups"`
+	CallbackURL     string `json:"callback_url"`
 	Remark          string `json:"remark"`
+}
+
+func (in *keyInput) normalize() error {
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		return errors.New("名称必填")
+	}
+	in.RateLimitPerMin = max(in.RateLimitPerMin, 0)
+	in.IPWhitelist = strings.TrimSpace(in.IPWhitelist)
+	in.Groups = strings.Join(core.SplitList(in.Groups), ",")
+	in.CallbackURL = strings.TrimSpace(in.CallbackURL)
+	if in.CallbackURL != "" {
+		u, err := url.Parse(in.CallbackURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("回调地址必须是 http(s):// 开头的 URL")
+		}
+	}
+	return nil
+}
+
+type keyView struct {
+	store.APIKey
+	CallbackSecret string `json:"callback_secret"`
+}
+
+func (s *Server) newCallbackSecret() (enc, plain string, err error) {
+	plain = "whsec_" + secure.RandomString(32)
+	enc, err = s.box.Encrypt(plain)
+	return
 }
 
 func (s *Server) listKeys(c *gin.Context) {
@@ -275,18 +320,33 @@ func (s *Server) listKeys(c *gin.Context) {
 		fail(c, err)
 		return
 	}
-	c.JSON(200, keys)
+	out := make([]keyView, 0, len(keys))
+	for _, k := range keys {
+		sec, _ := s.box.Decrypt(k.CallbackSecret)
+		out = append(out, keyView{APIKey: k, CallbackSecret: sec})
+	}
+	c.JSON(200, out)
 }
 
 func (s *Server) createKey(c *gin.Context) {
 	var in keyInput
-	if c.ShouldBindJSON(&in) != nil || strings.TrimSpace(in.Name) == "" {
-		bad(c, "名称必填")
+	if c.ShouldBindJSON(&in) != nil {
+		bad(c, "invalid body")
+		return
+	}
+	if err := in.normalize(); err != nil {
+		bad(c, err.Error())
+		return
+	}
+	enc, _, err := s.newCallbackSecret()
+	if err != nil {
+		fail(c, err)
 		return
 	}
 	raw := secure.NewAPIKey()
-	k := store.APIKey{Name: strings.TrimSpace(in.Name), Prefix: raw[:10], KeyHash: secure.HashAPIKey(raw), Enabled: true,
-		RateLimitPerMin: max(in.RateLimitPerMin, 0), IPWhitelist: strings.TrimSpace(in.IPWhitelist), Remark: in.Remark}
+	k := store.APIKey{Name: in.Name, Prefix: raw[:10], KeyHash: secure.HashAPIKey(raw), Enabled: true,
+		RateLimitPerMin: in.RateLimitPerMin, IPWhitelist: in.IPWhitelist, Groups: in.Groups, CallbackURL: in.CallbackURL,
+		CallbackSecret: enc, Remark: in.Remark}
 	if err := s.db.DB.Create(&k).Error; err != nil {
 		fail(c, err)
 		return
@@ -300,15 +360,33 @@ func (s *Server) updateKey(c *gin.Context) {
 		return
 	}
 	var in keyInput
-	if c.ShouldBindJSON(&in) != nil || strings.TrimSpace(in.Name) == "" {
-		bad(c, "名称必填")
+	if c.ShouldBindJSON(&in) != nil {
+		bad(c, "invalid body")
 		return
 	}
-	res := s.db.DB.Model(&store.APIKey{}).Where("id = ?", id).Select("name", "enabled", "rate_limit_per_min", "ip_whitelist", "remark").
-		Updates(&store.APIKey{Name: strings.TrimSpace(in.Name), Enabled: in.Enabled, RateLimitPerMin: max(in.RateLimitPerMin, 0),
-			IPWhitelist: strings.TrimSpace(in.IPWhitelist), Remark: in.Remark})
-	if res.Error != nil {
-		fail(c, res.Error)
+	if err := in.normalize(); err != nil {
+		bad(c, err.Error())
+		return
+	}
+	var k store.APIKey
+	if err := s.db.DB.First(&k, id).Error; err != nil {
+		notFoundOr(c, err)
+		return
+	}
+	k.Name, k.Enabled, k.RateLimitPerMin, k.IPWhitelist, k.Groups, k.CallbackURL, k.Remark =
+		in.Name, in.Enabled, in.RateLimitPerMin, in.IPWhitelist, in.Groups, in.CallbackURL, in.Remark
+	cols := []string{"name", "enabled", "rate_limit_per_min", "ip_whitelist", "group_tags", "callback_url", "remark"}
+	if k.CallbackSecret == "" { // keys created before callbacks existed
+		enc, _, err := s.newCallbackSecret()
+		if err != nil {
+			fail(c, err)
+			return
+		}
+		k.CallbackSecret = enc
+		cols = append(cols, "callback_secret")
+	}
+	if err := s.db.DB.Model(&k).Select(cols).Updates(&k).Error; err != nil {
+		fail(c, err)
 		return
 	}
 	c.JSON(200, gin.H{"ok": true})
@@ -324,109 +402,6 @@ func (s *Server) deleteKey(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"ok": true})
-}
-
-// ---------- templates ----------
-
-func (s *Server) listTemplates(c *gin.Context) {
-	var ts []store.Template
-	if err := s.db.DB.Order("id").Find(&ts).Error; err != nil {
-		fail(c, err)
-		return
-	}
-	c.JSON(200, ts)
-}
-
-func validateTemplate(t *store.Template) error {
-	t.Name = strings.TrimSpace(t.Name)
-	if t.Name == "" || strings.ContainsAny(t.Name, " /") {
-		return errors.New("模板名必填，且不能包含空格或 /")
-	}
-	if strings.TrimSpace(t.Subject) == "" {
-		return errors.New("主题必填")
-	}
-	if t.HTML == "" && t.Text == "" {
-		return errors.New("HTML 和纯文本至少填一个")
-	}
-	_, _, err := core.RenderTemplate(*t, map[string]any{}, "")
-	return err
-}
-
-func (s *Server) createTemplate(c *gin.Context) {
-	var t store.Template
-	if c.ShouldBindJSON(&t) != nil {
-		bad(c, "invalid body")
-		return
-	}
-	t.ID = 0
-	if err := validateTemplate(&t); err != nil {
-		bad(c, err.Error())
-		return
-	}
-	if err := s.db.DB.Create(&t).Error; err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			bad(c, "模板名已存在")
-			return
-		}
-		fail(c, err)
-		return
-	}
-	c.JSON(200, t)
-}
-
-func (s *Server) updateTemplate(c *gin.Context) {
-	id, ok := idParam(c)
-	if !ok {
-		return
-	}
-	var t store.Template
-	if c.ShouldBindJSON(&t) != nil {
-		bad(c, "invalid body")
-		return
-	}
-	t.ID = id
-	if err := validateTemplate(&t); err != nil {
-		bad(c, err.Error())
-		return
-	}
-	if err := s.db.DB.Model(&t).Select("name", "subject", "html", "text", "remark").Updates(&t).Error; err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			bad(c, "模板名已存在")
-			return
-		}
-		fail(c, err)
-		return
-	}
-	c.JSON(200, t)
-}
-
-func (s *Server) deleteTemplate(c *gin.Context) {
-	id, ok := idParam(c)
-	if !ok {
-		return
-	}
-	if err := s.db.DB.Delete(&store.Template{}, id).Error; err != nil {
-		fail(c, err)
-		return
-	}
-	c.JSON(200, gin.H{"ok": true})
-}
-
-func (s *Server) previewTemplate(c *gin.Context) {
-	var req struct {
-		store.Template
-		Vars map[string]any `json:"vars"`
-	}
-	if c.ShouldBindJSON(&req) != nil {
-		bad(c, "invalid body")
-		return
-	}
-	out, _, err := core.RenderTemplate(req.Template, req.Vars, "")
-	if err != nil {
-		fail(c, err)
-		return
-	}
-	c.JSON(200, out)
 }
 
 // ---------- messages ----------

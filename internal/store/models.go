@@ -20,6 +20,8 @@ type Account struct {
 	LimitPerDay    int    `json:"limit_per_day"`
 	Enabled        bool   `json:"enabled"`
 	Remark         string `json:"remark"`
+	Groups         string `gorm:"column:group_tags" json:"groups"` // comma separated tags; API keys bound to groups only use matching accounts
+	PreferDomains  string `json:"prefer_domains"`                  // comma separated recipient domains this account is tried first for
 
 	// health state, maintained by the scheduler
 	ConsecutiveFails int        `json:"consecutive_fails"`
@@ -40,23 +42,14 @@ type APIKey struct {
 	Prefix          string     `json:"prefix"` // first chars of the key, for display
 	KeyHash         string     `gorm:"uniqueIndex" json:"-"`
 	Enabled         bool       `json:"enabled"`
-	RateLimitPerMin int        `json:"rate_limit_per_min"` // 0 = unlimited
-	IPWhitelist     string     `json:"ip_whitelist"`       // comma separated IPs / CIDRs, empty = any
+	RateLimitPerMin int        `json:"rate_limit_per_min"`              // 0 = unlimited
+	IPWhitelist     string     `json:"ip_whitelist"`                    // comma separated IPs / CIDRs, empty = any
+	Groups          string     `gorm:"column:group_tags" json:"groups"` // comma separated account groups this key may use, empty = all
+	CallbackURL     string     `json:"callback_url"`                    // delivery status webhook, empty = off
+	CallbackSecret  string     `json:"-"`                               // encrypted HMAC secret for signing callbacks
 	Remark          string     `json:"remark"`
 	LastUsedAt      *time.Time `json:"last_used_at"`
 	CreatedAt       time.Time  `json:"created_at"`
-}
-
-// Template is a reusable mail body rendered with Go template syntax ({{.code}}).
-type Template struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	Name      string    `gorm:"uniqueIndex" json:"name"`
-	Subject   string    `json:"subject"`
-	HTML      string    `json:"html"`
-	Text      string    `json:"text"`
-	Remark    string    `json:"remark"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
 }
 
 const (
@@ -74,14 +67,15 @@ type Message struct {
 	FromAddr   string     `json:"from_addr"`
 	To         string     `gorm:"index" json:"to"`
 	Subject    string     `json:"subject"`
-	Template   string     `json:"template"`
 	Source     string     `json:"source"` // api | smtp
 	Status     string     `gorm:"index" json:"status"`
 	Attempts   int        `json:"attempts"`
 	Error      string     `json:"error"`
 	DurationMs int64      `json:"duration_ms"`
 	ClientIP   string     `json:"client_ip"`
-	Payload    string     `json:"-"`          // rendered content kept until delivered (for async queue recovery)
+	Ref        string     `json:"ref"`        // client reference from the X-MS-Ref header
+	MsgID      string     `json:"msg_id"`     // Message-ID header as delivered
+	Callback   string     `json:"callback"`   // delivery callback result: "", ok, or the error
 	Permanent  bool       `gorm:"-" json:"-"` // set by delivery when the failure is permanent (bad recipient)
 	CreatedAt  time.Time  `gorm:"index" json:"created_at"`
 	SentAt     *time.Time `json:"sent_at"`
@@ -109,6 +103,18 @@ type DailyStat struct {
 	AttOK       int64  `json:"att_ok"`
 	AttFail     int64  `json:"att_fail"`
 	AttMsSum    int64  `json:"att_ms_sum"` // sum of successful attempt durations
+}
+
+// Suppression blocks a recipient address, normally after a permanent bounce, to protect account reputation.
+type Suppression struct {
+	ID        uint       `gorm:"primaryKey" json:"id"`
+	Addr      string     `gorm:"uniqueIndex" json:"addr"` // lower case
+	Reason    string     `json:"reason"`
+	Source    string     `json:"source"` // bounce | manual
+	MessageID uint       `json:"message_id"`
+	Hits      int        `json:"hits"` // mails blocked since
+	ExpiresAt *time.Time `json:"expires_at"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // Setting is a key/value row for runtime settings and admin credentials.

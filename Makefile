@@ -15,9 +15,9 @@ build: web
 run: build
 	./bin/$(BIN)
 
-# Three fake SMTP servers on 2525-2527 (user/pass: test/test); 2527 always fails.
+# Three fake SMTP servers on 2600-2602 (user/pass: test/test); 2602 always fails.
 dev-smtp:
-	go run ./cmd/devsmtp -base 2525 -n 3 -fail 2527
+	go run ./cmd/devsmtp -base 2600 -n 3 -fail 2602
 
 release: web
 	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BIN)-linux-amd64 ./cmd/mailsender

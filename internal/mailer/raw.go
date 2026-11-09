@@ -16,7 +16,7 @@ import (
 // sendRaw relays a complete RFC 5322 message (from the SMTP ingress) through the account,
 // rewriting the sender headers so SPF/DMARC align with the account actually sending.
 func sendRaw(ctx context.Context, acc *store.Account, password string, c Content, timeout time.Duration) error {
-	data, err := RewriteHeaders(c.Raw, acc.FromAddr, acc.FromName, c.FromName)
+	data, err := RewriteHeaders(c.Raw, acc.FromAddr, acc.FromName, c.MsgIDLocal)
 	if err != nil {
 		return fmt.Errorf("invalid message: %w", err)
 	}
@@ -29,10 +29,12 @@ func sendRaw(ctx context.Context, acc *store.Account, password string, c Content
 		return err
 	}
 	defer cl.CloseWithSMTPClient(sc)
-	if err := sc.Mail(acc.FromAddr); err != nil {
+	// The low-level client sends the argument verbatim; RFC 5321 requires <addr>, and strict servers
+	// (163.com: "500 Error: bad syntax") reject bare addresses.
+	if err := sc.Mail(envelopeAddr(acc.FromAddr)); err != nil {
 		return fmt.Errorf("MAIL FROM: %w", err)
 	}
-	if err := sc.Rcpt(c.To); err != nil {
+	if err := sc.Rcpt(envelopeAddr(c.To)); err != nil {
 		e := fmt.Errorf("RCPT TO: %w", err)
 		if code := Code(err); code == 550 || code == 551 || code == 553 || code == 501 {
 			return &recipientError{e}
@@ -54,16 +56,31 @@ func sendRaw(ctx context.Context, acc *store.Account, password string, c Content
 	return nil
 }
 
+func envelopeAddr(addr string) string { return "<" + strings.Trim(strings.TrimSpace(addr), "<>") + ">" }
+
 // headers removed from relayed mail: replaced by us, or invalid once the sender changes
 var dropHeaders = map[string]bool{
 	"from": true, "sender": true, "return-path": true, "bcc": true,
 	"dkim-signature": true, "arc-seal": true, "arc-message-signature": true, "arc-authentication-results": true,
+	RefHeader: true,
+}
+
+// RefHeader carries the client's own reference for delivery callbacks; it is stripped before relaying.
+const RefHeader = "x-ms-ref"
+
+// MessageID builds the Message-ID used when the client did not set one: the local part is fixed per
+// message (so retries on other accounts keep it), the domain is the sending account's.
+func MessageID(local, fromAddr string) string {
+	if local == "" {
+		local = secure.RandomString(24)
+	}
+	return "<" + local + "@" + fromAddr[strings.LastIndex(fromAddr, "@")+1:] + ">"
 }
 
 // RewriteHeaders sets From to the sending account, keeps the client's display name, moves the client's
-// address to Reply-To, drops headers that would be wrong after relaying, and adds Message-ID/Date if missing.
-// nameOverride (if set) wins over both the client's and the account's display name.
-func RewriteHeaders(raw []byte, fromAddr, accountName, nameOverride string) ([]byte, error) {
+// address to Reply-To, drops headers that would be wrong after relaying, and adds Message-ID/Date if missing
+// (msgIDLocal is the local part for a generated Message-ID, random when empty).
+func RewriteHeaders(raw []byte, fromAddr, accountName, msgIDLocal string) ([]byte, error) {
 	head, body, sep := raw, []byte{}, -1
 	if i := bytes.Index(raw, []byte("\r\n\r\n")); i >= 0 {
 		head, body, sep = raw[:i], raw[i+4:], i
@@ -118,17 +135,13 @@ func RewriteHeaders(raw []byte, fromAddr, accountName, nameOverride string) ([]b
 			}
 		}
 	}
-	if nameOverride != "" {
-		displayName = nameOverride
-	}
 
 	out := []string{"From: " + (&netmail.Address{Name: displayName, Address: fromAddr}).String()}
 	if !hasReplyTo && orig != nil && !strings.EqualFold(orig.Address, fromAddr) {
 		out = append(out, "Reply-To: "+orig.String())
 	}
 	if !hasMsgID {
-		domain := fromAddr[strings.LastIndex(fromAddr, "@")+1:]
-		out = append(out, "Message-ID: <"+secure.RandomString(24)+"@"+domain+">")
+		out = append(out, "Message-ID: "+MessageID(msgIDLocal, fromAddr))
 	}
 	if !hasDate {
 		out = append(out, "Date: "+time.Now().Format(time.RFC1123Z))
@@ -143,18 +156,29 @@ func RewriteHeaders(raw []byte, fromAddr, accountName, nameOverride string) ([]b
 	return b.Bytes(), nil
 }
 
-// SubjectOf returns the decoded Subject header of a raw message.
-func SubjectOf(raw []byte) string {
+// Meta is what the service records about a raw message.
+type Meta struct {
+	Subject string // decoded
+	MsgID   string // client-set Message-ID, "" if none
+	Ref     string // X-MS-Ref value
+}
+
+// MetaOf extracts the decoded Subject, Message-ID and X-MS-Ref of a raw message.
+func MetaOf(raw []byte) Meta {
 	m, err := netmail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
-		return ""
+		return Meta{}
 	}
 	s := m.Header.Get("Subject")
 	if d, err := new(mime.WordDecoder).DecodeHeader(s); err == nil {
 		s = d
 	}
-	if len(s) > 300 {
-		s = s[:300]
+	return Meta{Subject: clip(s, 300), MsgID: clip(strings.TrimSpace(m.Header.Get("Message-Id")), 250), Ref: clip(strings.TrimSpace(m.Header.Get(RefHeader)), 200)}
+}
+
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
 	}
 	return s
 }

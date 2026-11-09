@@ -19,12 +19,13 @@ import (
 )
 
 type Content struct {
-	FromName string `json:"from_name,omitempty"`
-	To       string `json:"to"`
-	Subject  string `json:"subject"`
-	HTML     string `json:"html,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Raw      []byte `json:"raw,omitempty"` // complete message received by the SMTP ingress; relayed as-is
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+	HTML    string `json:"html,omitempty"`
+	Text    string `json:"text,omitempty"`
+	Raw     []byte `json:"raw,omitempty"` // complete message received by the SMTP ingress; relayed as-is
+
+	MsgIDLocal string `json:"-"` // local part of the generated Message-ID (raw mail without one)
 }
 
 // Kind classifies a delivery failure so the scheduler knows how to react.
@@ -97,11 +98,7 @@ func Send(ctx context.Context, acc *store.Account, password string, c Content, t
 		return sendRaw(ctx, acc, password, c, timeout)
 	}
 	m := mail.NewMsg()
-	fromName := acc.FromName
-	if c.FromName != "" {
-		fromName = c.FromName
-	}
-	if err := m.FromFormat(fromName, acc.FromAddr); err != nil {
+	if err := m.FromFormat(acc.FromName, acc.FromAddr); err != nil {
 		return fmt.Errorf("invalid from address: %w", err)
 	}
 	if err := m.To(c.To); err != nil {

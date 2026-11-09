@@ -20,7 +20,11 @@ async function request(method, url, body) {
     window.location.href = '/login'
     throw new Error('登录已过期')
   }
-  if (!res.ok) throw new Error(data?.message || `${res.status} ${res.statusText}`)
+  if (!res.ok) {
+    const err = new Error(data?.message || `${res.status} ${res.statusText}`)
+    err.code = data?.code
+    throw err
+  }
   return data
 }
 

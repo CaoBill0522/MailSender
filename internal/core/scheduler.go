@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,10 @@ type Scheduler struct {
 	cfg    *SettingsStore
 	states map[uint]*accState
 	lastRR uint
+
+	// health transition hooks (alerts); called without the lock held
+	OnCooldown func(acc store.Account, until time.Time)
+	OnRecover  func(acc store.Account)
 }
 
 type Lease struct {
@@ -164,17 +169,28 @@ func (st *accState) check(now time.Time) string {
 	return ""
 }
 
+// Route restricts which accounts may send a message.
+type Route struct {
+	Groups []string // the account must carry one of these tags; empty = any account
+	Domain string   // recipient domain; accounts listing it in PreferDomains are tried first
+}
+
 // Acquire picks an account (excluding already-tried ones) and reserves one send slot on it.
-func (s *Scheduler) Acquire(exclude map[uint]bool) (*Lease, error) {
+func (s *Scheduler) Acquire(exclude map[uint]bool, rt Route) (*Lease, error) {
 	strategy := s.cfg.Get().Strategy
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var cands []*accState
+	var cands, preferred []*accState
 	reasons := map[string]int{}
+	inGroup := 0
 	for _, st := range s.states {
 		st.prune(now)
+		if !MatchGroups(st.acc.Groups, rt.Groups) {
+			continue
+		}
+		inGroup++
 		if exclude[st.acc.ID] {
 			continue
 		}
@@ -183,15 +199,23 @@ func (s *Scheduler) Acquire(exclude map[uint]bool) (*Lease, error) {
 			continue
 		}
 		cands = append(cands, st)
+		if rt.Domain != "" && MatchDomain(st.acc.PreferDomains, rt.Domain) {
+			preferred = append(preferred, st)
+		}
 	}
 	if len(cands) == 0 {
-		if len(s.states) == 0 {
+		switch {
+		case len(s.states) == 0:
 			return nil, fmt.Errorf("%w: no accounts configured", ErrNoAccount)
-		}
-		if len(reasons) == 0 {
+		case inGroup == 0:
+			return nil, fmt.Errorf("%w: no accounts in group %s", ErrNoAccount, strings.Join(rt.Groups, "/"))
+		case len(reasons) == 0:
 			return nil, fmt.Errorf("%w: all accounts already tried", ErrNoAccount)
 		}
 		return nil, fmt.Errorf("%w: %s", ErrNoAccount, summarize(reasons))
+	}
+	if len(preferred) > 0 {
+		cands = preferred
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].acc.ID < cands[j].acc.ID })
 
@@ -245,6 +269,47 @@ func (s *Scheduler) Acquire(exclude map[uint]bool) (*Lease, error) {
 	return &Lease{Account: pick.acc, Password: pick.password}, nil
 }
 
+// SplitList splits a comma / space / newline separated list, lower-cased and de-duplicated.
+func SplitList(v string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == '，' || r == ' ' || r == '\n' || r == ';' }) {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// MatchGroups reports whether an account tagged with accGroups may serve a key limited to want (empty = any).
+func MatchGroups(accGroups string, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for _, g := range SplitList(accGroups) {
+		for _, w := range want {
+			if g == w {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// MatchDomain reports whether domain equals, or is a subdomain of, an entry of list.
+func MatchDomain(list, domain string) bool {
+	domain = strings.ToLower(domain)
+	for _, d := range SplitList(list) {
+		d = strings.TrimPrefix(strings.TrimPrefix(d, "*"), ".")
+		if d != "" && (domain == d || strings.HasSuffix(domain, "."+d)) {
+			return true
+		}
+	}
+	return false
+}
+
 func weight(st *accState) int {
 	if st.acc.Weight < 1 {
 		return 1
@@ -286,6 +351,8 @@ func (s *Scheduler) Report(id uint, kind mailer.Kind, errMsg string) {
 		return
 	}
 	a := &st.acc
+	hadCooldown := a.CooldownUntil != nil // also an expired one: the account was benched until this success
+	coolingNow := hadCooldown && now.Before(*a.CooldownUntil)
 	switch kind {
 	case mailer.KindOK:
 		a.ConsecutiveFails, a.CooldownUntil, a.LastError = 0, nil, ""
@@ -312,7 +379,14 @@ func (s *Scheduler) Report(id uint, kind mailer.Kind, errMsg string) {
 		"last_error":        a.LastError,
 		"last_used_at":      a.LastUsedAt,
 	}
+	snap := *a
 	s.mu.Unlock()
+	if !coolingNow && snap.CooldownUntil != nil && now.Before(*snap.CooldownUntil) && s.OnCooldown != nil {
+		s.OnCooldown(snap, *snap.CooldownUntil)
+	}
+	if hadCooldown && kind == mailer.KindOK && s.OnRecover != nil {
+		s.OnRecover(snap)
+	}
 	if err := s.db.DB.Model(&store.Account{}).Where("id = ?", id).UpdateColumns(upd).Error; err != nil {
 		log.Printf("persist account %d health: %v", id, err)
 	}

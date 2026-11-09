@@ -15,6 +15,9 @@
         <n-form-item label="密码">
           <n-input v-model:value="form.password" type="password" show-password-on="click" placeholder="首次启动日志中的密码" @keyup.enter="submit" />
         </n-form-item>
+        <n-form-item v-if="needOtp" label="两步验证码">
+          <n-input ref="otpInput" v-model:value="form.otp" placeholder="身份验证器中的 6 位数字" maxlength="6" :input-props="{ inputmode: 'numeric', autocomplete: 'one-time-code' }" @keyup.enter="submit" />
+        </n-form-item>
         <n-button type="primary" block :loading="loading" attr-type="submit" @click="submit">登录</n-button>
       </n-form>
     </n-card>
@@ -22,15 +25,17 @@
 </template>
 
 <script setup>
-import { reactive, ref } from 'vue'
+import { nextTick, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NCard, NForm, NFormItem, NInput, NButton } from 'naive-ui'
 import { api, setToken } from '../api'
 import { message } from '../utils'
 
 const router = useRouter()
-const form = reactive({ username: 'admin', password: '' })
+const form = reactive({ username: 'admin', password: '', otp: '' })
 const loading = ref(false)
+const needOtp = ref(false)
+const otpInput = ref(null)
 
 async function submit() {
   if (loading.value) return
@@ -40,7 +45,11 @@ async function submit() {
     setToken(r.token)
     router.replace('/')
   } catch (e) {
-    message.error(e.message)
+    if (e.code === 'otp_required') {
+      needOtp.value = true
+      await nextTick()
+      otpInput.value?.focus()
+    } else message.error(e.message)
   } finally {
     loading.value = false
   }

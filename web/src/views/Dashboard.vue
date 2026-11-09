@@ -76,7 +76,7 @@ const tiles = computed(() => {
     { label: '平均发送耗时', value: t.att_ok ? Math.round(t.att_ms_sum / t.att_ok) + ' ms' : '-', sub: '单次成功尝试' },
     { label: '今日被拦截', value: n(t.msg_rejected), sub: '收件人频率限制' },
     { label: '可用账号', value: `${o.accounts_available} / ${o.accounts_total}`, sub: `已启用 ${o.accounts_enabled}` },
-    { label: '队列中', value: n(o.queued), sub: `累计成功 ${n(o.total.msg_sent)}` },
+    { label: '累计发送成功', value: n(o.total.msg_sent), sub: `累计失败 ${n(o.total.msg_failed)}` },
   ]
 })
 

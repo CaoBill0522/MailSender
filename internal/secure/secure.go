@@ -140,15 +140,6 @@ func RandomString(n int) string {
 	return string(out)
 }
 
-func RandomDigits(n int) string {
-	out := make([]byte, n)
-	for i := range out {
-		v, _ := rand.Int(rand.Reader, big.NewInt(10))
-		out[i] = byte('0' + v.Int64())
-	}
-	return string(out)
-}
-
 // NewAPIKey returns a new plaintext key; only its hash is stored.
 func NewAPIKey() string { return "ms_" + RandomString(40) }
 

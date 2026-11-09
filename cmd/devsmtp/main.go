@@ -1,6 +1,6 @@
 // devsmtp runs several fake SMTP servers for local testing of MailSender's rotation.
 //
-//	go run ./cmd/devsmtp -base 2525 -n 3 -fail 2527
+//	go run ./cmd/devsmtp -base 2600 -n 3 -fail 2602
 //
 // Each server accepts AUTH PLAIN with user "test" / password "test", prints received
 // mail headers, and the port given by -fail rejects every message with a 451.
@@ -92,7 +92,7 @@ func (s *session) Reset()        { s.from, s.to = "", nil }
 func (s *session) Logout() error { return nil }
 
 func main() {
-	base := flag.Int("base", 2525, "first port")
+	base := flag.Int("base", 2600, "first port")
 	n := flag.Int("n", 3, "number of servers")
 	failPort := flag.Int("fail", 0, "port that rejects all mail (0 = none)")
 	flag.Parse()
