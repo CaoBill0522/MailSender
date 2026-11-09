@@ -248,9 +248,10 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 
 // RuntimeInfo describes listeners and TLS, shown in the console so users know how to connect.
 type RuntimeInfo struct {
-	TLSMode     string      `json:"tls_mode"` // none | files | acme
-	TLSDomains  []string    `json:"tls_domains"`
-	HTTPListen  string      `json:"http_listen"`
-	HTTPSListen string      `json:"https_listen"`
-	SMTP        *smtpd.Info `json:"smtp"` // nil when the SMTP ingress is disabled
+	TLSMode      string      `json:"tls_mode"` // none | files | acme
+	TLSDomains   []string    `json:"tls_domains"`
+	HTTPListen   string      `json:"http_listen"`
+	HTTPSListen  string      `json:"https_listen"`
+	HTTPRedirect bool        `json:"http_redirect"` // plain HTTP only redirects to HTTPS
+	SMTP         *smtpd.Info `json:"smtp"`          // nil when the SMTP ingress is disabled
 }

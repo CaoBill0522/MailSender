@@ -108,8 +108,14 @@ func main() {
 		}()
 	}
 	if cfg.Listen != "" {
-		// On plain HTTP, also answer Let's Encrypt HTTP-01 challenges when in ACME mode.
-		serve(&http.Server{Addr: cfg.Listen, Handler: tp.HTTPHandler(handler), ReadHeaderTimeout: 10 * time.Second}, false)
+		// In ACME mode plain HTTP only answers Let's Encrypt HTTP-01 challenges and redirects to HTTPS,
+		// so credentials are never sent in clear text. Otherwise it serves the app.
+		h := tp.HTTPHandler(handler)
+		if tp != nil && tp.Mode == "acme" && cfg.HTTPSListen != "" {
+			h = tp.HTTPHandler(nil)
+			info.HTTPRedirect = true
+		}
+		serve(&http.Server{Addr: cfg.Listen, Handler: h, ReadHeaderTimeout: 10 * time.Second}, false)
 	}
 	if tp != nil && cfg.HTTPSListen != "" {
 		serve(&http.Server{Addr: cfg.HTTPSListen, Handler: handler, TLSConfig: tp.Config(), ReadHeaderTimeout: 10 * time.Second}, true)

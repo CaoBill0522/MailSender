@@ -66,7 +66,7 @@
               <n-tag v-else size="small" type="success" :bordered="false">● {{ info.tls_mode === 'acme' ? "Let's Encrypt 自动证书" : '证书文件' }}</n-tag>
               <span v-if="info.tls_domains?.length" class="mono" style="margin-left: 8px; font-size: 12px">{{ info.tls_domains.join(', ') }}</span>
             </n-descriptions-item>
-            <n-descriptions-item label="HTTP">{{ info.http_listen || '关闭' }}</n-descriptions-item>
+            <n-descriptions-item label="HTTP">{{ info.http_listen || '关闭' }}<span v-if="info.http_redirect" class="hint">仅跳转到 HTTPS</span></n-descriptions-item>
             <n-descriptions-item label="HTTPS">{{ info.https_listen || '关闭' }}</n-descriptions-item>
             <n-descriptions-item label="SMTP（STARTTLS）">
               <template v-if="info.smtp?.listen">{{ info.smtp.listen }}<span v-if="!info.smtp.starttls" class="hint" style="color: #d03b3b">无 TLS，仅限内网</span></template>
