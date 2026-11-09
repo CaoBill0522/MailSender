@@ -8,6 +8,7 @@ import (
 	"fmt"
 	htmltpl "html/template"
 	"log"
+	"net"
 	netmail "net/mail"
 	"strings"
 	"sync"
@@ -67,6 +68,7 @@ type Service struct {
 
 	queue    chan uint
 	inflight sync.Map // message id -> struct{}
+	keyTouch sync.Map // api key id -> last time last_used_at was persisted
 }
 
 const DefaultCodeTemplate = "verify_code"
@@ -298,26 +300,16 @@ func (s *Service) Submit(key *store.APIKey, clientIP string, req SendRequest) (*
 		return nil, apiErr(400, "bad_request", "rendered subject is empty")
 	}
 
-	set := s.Cfg.Get()
-	if ok, wait := s.rcpt.Allow(req.To, time.Duration(set.RecipientIntervalSec)*time.Second, set.RecipientDailyMax); !ok {
-		_ = s.DB.IncStat(store.Day(time.Now()), key.ID, 0, store.DailyStat{MsgRejected: 1})
-		if wait < 0 {
-			return nil, apiErr(429, "recipient_daily_limit", "daily limit for this recipient reached")
-		}
-		return nil, apiErr(429, "recipient_too_frequent", "too frequent for this recipient, retry in %ds", int(wait.Seconds())+1)
+	if err := s.CheckRecipient(key, req.To); err != nil {
+		return nil, err
 	}
 
-	payload, _ := json.Marshal(content)
 	logSubject := content.Subject
 	if req.secret != "" {
 		logSubject = strings.ReplaceAll(logSubject, req.secret, strings.Repeat("*", len(req.secret)))
 	}
-	m := &store.Message{
-		APIKeyID: key.ID, APIKeyName: key.Name,
-		To: req.To, Subject: logSubject, Template: tplName,
-		Status: store.StatusQueued, ClientIP: clientIP, Payload: string(payload),
-	}
-	if err := s.DB.DB.Create(m).Error; err != nil {
+	m, err := s.record(key, clientIP, "api", req.To, logSubject, tplName, content)
+	if err != nil {
 		return nil, err
 	}
 	if req.Async {
@@ -328,6 +320,108 @@ func (s *Service) Submit(key *store.APIKey, clientIP string, req SendRequest) (*
 	defer s.inflight.Delete(m.ID)
 	s.deliver(m, false)
 	return m, nil
+}
+
+// CheckRecipient applies the per-recipient frequency limits and reserves a slot.
+func (s *Service) CheckRecipient(key *store.APIKey, to string) *APIError {
+	set := s.Cfg.Get()
+	if ok, wait := s.rcpt.Allow(to, time.Duration(set.RecipientIntervalSec)*time.Second, set.RecipientDailyMax); !ok {
+		_ = s.DB.IncStat(store.Day(time.Now()), key.ID, 0, store.DailyStat{MsgRejected: 1})
+		if wait < 0 {
+			return apiErr(429, "recipient_daily_limit", "daily limit for this recipient reached")
+		}
+		return apiErr(429, "recipient_too_frequent", "too frequent for this recipient, retry in %ds", int(wait.Seconds())+1)
+	}
+	return nil
+}
+
+func (s *Service) record(key *store.APIKey, clientIP, source, to, subject, tplName string, content mailer.Content) (*store.Message, error) {
+	payload, err := json.Marshal(content)
+	if err != nil {
+		return nil, err
+	}
+	m := &store.Message{
+		APIKeyID: key.ID, APIKeyName: key.Name, Source: source,
+		To: to, Subject: subject, Template: tplName,
+		Status: store.StatusQueued, ClientIP: clientIP, Payload: string(payload),
+	}
+	return m, s.DB.DB.Create(m).Error
+}
+
+// SubmitRaw relays a message received over SMTP to each recipient (one tracked message per recipient)
+// and waits for the results. Recipient limits must already have been checked at RCPT time.
+func (s *Service) SubmitRaw(key *store.APIKey, clientIP string, rcpts []string, raw []byte) ([]*store.Message, error) {
+	subject := mailer.SubjectOf(raw)
+	msgs := make([]*store.Message, len(rcpts))
+	for i, to := range rcpts {
+		m, err := s.record(key, clientIP, "smtp", to, subject, "", mailer.Content{To: to, Subject: subject, Raw: raw})
+		if err != nil {
+			return nil, err
+		}
+		msgs[i] = m
+	}
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for _, m := range msgs {
+		wg.Add(1)
+		sem <- struct{}{}
+		s.inflight.Store(m.ID, struct{}{})
+		go func(m *store.Message) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer s.inflight.Delete(m.ID)
+			s.deliver(m, false)
+		}(m)
+	}
+	wg.Wait()
+	return msgs, nil
+}
+
+// AuthKey resolves a plaintext API key and checks that it is enabled and allowed from clientIP.
+func (s *Service) AuthKey(raw, clientIP string) (*store.APIKey, *APIError) {
+	if raw == "" {
+		return nil, apiErr(401, "unauthorized", "missing API key")
+	}
+	var k store.APIKey
+	if err := s.DB.DB.Where("key_hash = ?", secure.HashAPIKey(raw)).First(&k).Error; err != nil || !k.Enabled {
+		return nil, apiErr(401, "unauthorized", "invalid or disabled API key")
+	}
+	if !IPAllowed(k.IPWhitelist, clientIP) {
+		return nil, apiErr(403, "ip_forbidden", "client IP not in whitelist: %s", clientIP)
+	}
+	now := time.Now()
+	if v, ok := s.keyTouch.Load(k.ID); !ok || now.Sub(v.(time.Time)) > time.Minute {
+		s.keyTouch.Store(k.ID, now)
+		s.DB.DB.Model(&store.APIKey{}).Where("id = ?", k.ID).UpdateColumn("last_used_at", now)
+	}
+	return &k, nil
+}
+
+// AllowKeyRate applies the key's requests-per-minute limit.
+func (s *Service) AllowKeyRate(k *store.APIKey) *APIError {
+	if !s.Keys.Allow(k.ID, k.RateLimitPerMin) {
+		return apiErr(429, "key_rate_limited", "API key rate limit exceeded")
+	}
+	return nil
+}
+
+// IPAllowed reports whether ip matches a comma/space/newline separated list of IPs and CIDRs (empty = any).
+func IPAllowed(list, ip string) bool {
+	list = strings.TrimSpace(list)
+	if list == "" {
+		return true
+	}
+	addr := net.ParseIP(ip)
+	for _, item := range strings.FieldsFunc(list, func(r rune) bool { return r == ',' || r == '\n' || r == ' ' }) {
+		if strings.Contains(item, "/") {
+			if _, n, err := net.ParseCIDR(item); err == nil && addr != nil && n.Contains(addr) {
+				return true
+			}
+		} else if p := net.ParseIP(item); p != nil && addr != nil && p.Equal(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // SendCode is a convenience wrapper for verification-code mails.
@@ -419,6 +513,7 @@ func (s *Service) deliver(m *store.Message, canDefer bool) {
 		}
 		errs = append(errs, fmt.Sprintf("[%s] %s", acc.Name, mailer.Short(err)))
 		if kind == mailer.KindRecipient {
+			m.Permanent = true
 			break
 		}
 	}

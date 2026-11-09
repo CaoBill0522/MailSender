@@ -59,6 +59,28 @@
             <n-button :loading="pwSaving" @click="changePw">修改密码</n-button>
           </n-form>
         </n-card>
+        <n-card v-if="info" size="small" title="服务与证书" style="margin-top: 16px">
+          <n-descriptions :column="1" label-placement="left" size="small" bordered>
+            <n-descriptions-item label="TLS 证书">
+              <n-tag v-if="info.tls_mode === 'none'" size="small" type="warning" :bordered="false">◐ 未配置</n-tag>
+              <n-tag v-else size="small" type="success" :bordered="false">● {{ info.tls_mode === 'acme' ? "Let's Encrypt 自动证书" : '证书文件' }}</n-tag>
+              <span v-if="info.tls_domains?.length" class="mono" style="margin-left: 8px; font-size: 12px">{{ info.tls_domains.join(', ') }}</span>
+            </n-descriptions-item>
+            <n-descriptions-item label="HTTP">{{ info.http_listen || '关闭' }}</n-descriptions-item>
+            <n-descriptions-item label="HTTPS">{{ info.https_listen || '关闭' }}</n-descriptions-item>
+            <n-descriptions-item label="SMTP（STARTTLS）">
+              <template v-if="info.smtp?.listen">{{ info.smtp.listen }}<span v-if="!info.smtp.starttls" class="hint" style="color: #d03b3b">无 TLS，仅限内网</span></template>
+              <template v-else>关闭</template>
+            </n-descriptions-item>
+            <n-descriptions-item label="SMTPS（SSL）">{{ info.smtp?.listen_tls || '关闭' }}</n-descriptions-item>
+          </n-descriptions>
+          <div class="muted" style="margin-top: 10px; line-height: 1.8">
+            以上通过启动参数或环境变量配置，修改后需重启：<br />
+            证书文件：<span class="mono">MS_TLS_CERT</span> / <span class="mono">MS_TLS_KEY</span>（文件更新后自动重新加载）<br />
+            自动证书：<span class="mono">MS_TLS_DOMAIN=mail.example.com</span>（需 80/443 端口可从公网访问）<br />
+            端口：<span class="mono">MS_HTTPS_LISTEN</span>、<span class="mono">MS_SMTP_LISTEN</span>、<span class="mono">MS_SMTPS_LISTEN</span>
+          </div>
+        </n-card>
         <n-card size="small" title="策略说明" style="margin-top: 16px">
           <ul class="explain">
             <li><b>加权轮询</b>：按权重均匀交替，权重 2 的账号发信量约为权重 1 的两倍（推荐）。</li>
@@ -75,7 +97,7 @@
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
-import { NButton, NCard, NForm, NFormItem, NInput, NInputNumber, NSelect, NGrid, NGi } from 'naive-ui'
+import { NButton, NCard, NForm, NFormItem, NInput, NInputNumber, NSelect, NGrid, NGi, NDescriptions, NDescriptionsItem, NTag } from 'naive-ui'
 import { api, setToken } from '../api'
 import { message } from '../utils'
 
@@ -117,8 +139,9 @@ async function changePw() {
   }
 }
 
+const info = ref(null)
 onMounted(async () => {
-  s.value = await api.get('/settings')
+  ;[s.value, info.value] = await Promise.all([api.get('/settings'), api.get('/server-info')])
 })
 </script>
 

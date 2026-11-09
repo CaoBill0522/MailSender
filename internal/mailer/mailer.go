@@ -24,6 +24,7 @@ type Content struct {
 	Subject  string `json:"subject"`
 	HTML     string `json:"html,omitempty"`
 	Text     string `json:"text,omitempty"`
+	Raw      []byte `json:"raw,omitempty"` // complete message received by the SMTP ingress; relayed as-is
 }
 
 // Kind classifies a delivery failure so the scheduler knows how to react.
@@ -92,6 +93,9 @@ func newClient(acc *store.Account, password string, timeout time.Duration) (*mai
 
 // Send delivers one message through the account.
 func Send(ctx context.Context, acc *store.Account, password string, c Content, timeout time.Duration) error {
+	if len(c.Raw) > 0 {
+		return sendRaw(ctx, acc, password, c, timeout)
+	}
 	m := mail.NewMsg()
 	fromName := acc.FromName
 	if c.FromName != "" {

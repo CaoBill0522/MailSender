@@ -14,7 +14,9 @@ import (
 	"mailsender/internal/core"
 	"mailsender/internal/secure"
 	"mailsender/internal/server"
+	"mailsender/internal/smtpd"
 	"mailsender/internal/store"
+	"mailsender/internal/tlsutil"
 	"mailsender/web"
 )
 
@@ -45,6 +47,11 @@ func main() {
 		log.Fatalf("seed: %v", err)
 	}
 
+	tp, err := tlsutil.New(tlsutil.Options{CertFile: cfg.TLSCert, KeyFile: cfg.TLSKey, Domains: cfg.TLSDomains, ACMEEmail: cfg.ACMEEmail, DataDir: cfg.DataDir})
+	if err != nil {
+		log.Fatalf("tls: %v", err)
+	}
+
 	settings := core.NewSettingsStore(db)
 	sched, err := core.NewScheduler(db, box, settings)
 	if err != nil {
@@ -56,20 +63,63 @@ func main() {
 	defer stop()
 	svc.Start(ctx, 4)
 
-	srv := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           server.New(db, svc, box, web.FS()).Handler(cfg.TrustedProxies),
-		ReadHeaderTimeout: 10 * time.Second,
+	info := &server.RuntimeInfo{TLSMode: "none", HTTPListen: cfg.Listen}
+	if tp != nil {
+		info.TLSMode, info.TLSDomains, info.HTTPSListen = tp.Mode, tp.Domains, cfg.HTTPSListen
 	}
-	go func() {
-		log.Printf("MailSender listening on %s (data: %s)", cfg.Listen, cfg.DataDir)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
+
+	// SMTP ingress
+	if cfg.SMTPListen != "" || cfg.SMTPSListen != "" {
+		o := smtpd.Options{
+			Listen: cfg.SMTPListen, ListenTLS: cfg.SMTPSListen,
+			Hostname: cfg.SMTPHostname, AllowInsecureAuth: cfg.SMTPInsecureAuth,
+			MaxMessageBytes: int64(cfg.SMTPMaxMessageMiB) << 20,
 		}
-	}()
+		if tp != nil {
+			o.TLS = tp.SMTPConfig()
+			if o.Hostname == "" {
+				o.Hostname = tp.Hostname()
+			}
+		}
+		ing, err := smtpd.Start(svc, o)
+		if err != nil {
+			log.Fatalf("smtp ingress: %v", err)
+		}
+		defer ing.Close()
+		info.SMTP = &ing.Info
+	}
+
+	handler := server.New(db, svc, box, web.FS(), info).Handler(cfg.TrustedProxies)
+	var servers []*http.Server
+	serve := func(s *http.Server, tlsOn bool) {
+		servers = append(servers, s)
+		go func() {
+			var err error
+			if tlsOn {
+				log.Printf("HTTPS listening on %s (%s)", s.Addr, info.TLSMode)
+				err = s.ListenAndServeTLS("", "")
+			} else {
+				log.Printf("HTTP listening on %s (data: %s)", s.Addr, cfg.DataDir)
+				err = s.ListenAndServe()
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("listen %s: %v", s.Addr, err)
+			}
+		}()
+	}
+	if cfg.Listen != "" {
+		// On plain HTTP, also answer Let's Encrypt HTTP-01 challenges when in ACME mode.
+		serve(&http.Server{Addr: cfg.Listen, Handler: tp.HTTPHandler(handler), ReadHeaderTimeout: 10 * time.Second}, false)
+	}
+	if tp != nil && cfg.HTTPSListen != "" {
+		serve(&http.Server{Addr: cfg.HTTPSListen, Handler: handler, TLSConfig: tp.Config(), ReadHeaderTimeout: 10 * time.Second}, true)
+	}
+
 	<-ctx.Done()
 	log.Printf("shutting down…")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	for _, s := range servers {
+		_ = s.Shutdown(shutdownCtx)
+	}
 }

@@ -75,12 +75,14 @@ type Message struct {
 	To         string     `gorm:"index" json:"to"`
 	Subject    string     `json:"subject"`
 	Template   string     `json:"template"`
+	Source     string     `json:"source"` // api | smtp
 	Status     string     `gorm:"index" json:"status"`
 	Attempts   int        `json:"attempts"`
 	Error      string     `json:"error"`
 	DurationMs int64      `json:"duration_ms"`
 	ClientIP   string     `json:"client_ip"`
-	Payload    string     `json:"-"` // rendered content kept until delivered (for async queue recovery)
+	Payload    string     `json:"-"`          // rendered content kept until delivered (for async queue recovery)
+	Permanent  bool       `gorm:"-" json:"-"` // set by delivery when the failure is permanent (bad recipient)
 	CreatedAt  time.Time  `gorm:"index" json:"created_at"`
 	SentAt     *time.Time `json:"sent_at"`
 }

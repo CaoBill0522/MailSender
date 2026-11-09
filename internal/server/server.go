@@ -3,10 +3,8 @@ package server
 import (
 	"errors"
 	"io/fs"
-	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +12,7 @@ import (
 
 	"mailsender/internal/core"
 	"mailsender/internal/secure"
+	"mailsender/internal/smtpd"
 	"mailsender/internal/store"
 )
 
@@ -23,12 +22,11 @@ type Server struct {
 	box  *secure.Box
 	web  fs.FS
 	auth *adminAuth
-
-	keyTouch sync.Map // api key id -> last persisted time
+	info *RuntimeInfo
 }
 
-func New(db *store.Store, svc *core.Service, box *secure.Box, web fs.FS) *Server {
-	return &Server{db: db, svc: svc, box: box, web: web, auth: &adminAuth{db: db, box: box}}
+func New(db *store.Store, svc *core.Service, box *secure.Box, web fs.FS, info *RuntimeInfo) *Server {
+	return &Server{db: db, svc: svc, box: box, web: web, info: info, auth: &adminAuth{db: db, box: box}}
 }
 
 func (s *Server) Handler(trustedProxies []string) http.Handler {
@@ -79,6 +77,7 @@ func (s *Server) Handler(trustedProxies []string) http.Handler {
 	ad.GET("/stats/keys", s.statsKeys)
 
 	ad.GET("/settings", s.getSettings)
+	ad.GET("/server-info", func(c *gin.Context) { c.JSON(200, s.info) })
 	ad.PUT("/settings", s.putSettings)
 
 	r.NoRoute(s.serveSPA)
@@ -137,50 +136,16 @@ func bearer(c *gin.Context) string {
 }
 
 func (s *Server) apiKeyAuth(c *gin.Context) {
-	raw := bearer(c)
-	if raw == "" {
-		c.AbortWithStatusJSON(401, gin.H{"code": "unauthorized", "message": "missing API key"})
+	k, aerr := s.svc.AuthKey(bearer(c), c.ClientIP())
+	if aerr == nil {
+		aerr = s.svc.AllowKeyRate(k)
+	}
+	if aerr != nil {
+		c.AbortWithStatusJSON(aerr.Status, aerr)
 		return
 	}
-	var k store.APIKey
-	if err := s.db.DB.Where("key_hash = ?", secure.HashAPIKey(raw)).First(&k).Error; err != nil || !k.Enabled {
-		c.AbortWithStatusJSON(401, gin.H{"code": "unauthorized", "message": "invalid or disabled API key"})
-		return
-	}
-	if !ipAllowed(k.IPWhitelist, c.ClientIP()) {
-		c.AbortWithStatusJSON(403, gin.H{"code": "ip_forbidden", "message": "client IP not in whitelist: " + c.ClientIP()})
-		return
-	}
-	if !s.svc.Keys.Allow(k.ID, k.RateLimitPerMin) {
-		c.AbortWithStatusJSON(429, gin.H{"code": "key_rate_limited", "message": "API key rate limit exceeded"})
-		return
-	}
-	// persist last_used_at at most once a minute per key
-	now := time.Now()
-	if v, ok := s.keyTouch.Load(k.ID); !ok || now.Sub(v.(time.Time)) > time.Minute {
-		s.keyTouch.Store(k.ID, now)
-		s.db.DB.Model(&store.APIKey{}).Where("id = ?", k.ID).UpdateColumn("last_used_at", now)
-	}
-	c.Set("apikey", &k)
+	c.Set("apikey", k)
 	c.Next()
-}
-
-func ipAllowed(list, ip string) bool {
-	list = strings.TrimSpace(list)
-	if list == "" {
-		return true
-	}
-	addr := net.ParseIP(ip)
-	for _, item := range strings.FieldsFunc(list, func(r rune) bool { return r == ',' || r == '\n' || r == ' ' }) {
-		if strings.Contains(item, "/") {
-			if _, n, err := net.ParseCIDR(item); err == nil && addr != nil && n.Contains(addr) {
-				return true
-			}
-		} else if p := net.ParseIP(item); p != nil && addr != nil && p.Equal(addr) {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------- admin auth ----------
@@ -279,4 +244,13 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 	}
 	user, _ := s.db.GetSetting(keyAdminUser)
 	c.JSON(200, gin.H{"token": s.box.SignToken(user, s.auth.version(), tokenTTL)})
+}
+
+// RuntimeInfo describes listeners and TLS, shown in the console so users know how to connect.
+type RuntimeInfo struct {
+	TLSMode     string      `json:"tls_mode"` // none | files | acme
+	TLSDomains  []string    `json:"tls_domains"`
+	HTTPListen  string      `json:"http_listen"`
+	HTTPSListen string      `json:"https_listen"`
+	SMTP        *smtpd.Info `json:"smtp"` // nil when the SMTP ingress is disabled
 }

@@ -83,7 +83,8 @@ func (s *session) Data(r io.Reader) error {
 	if err != nil {
 		subject = msg.Header.Get("Subject")
 	}
-	log.Printf("[:%d] %s -> %s  subject=%q", s.b.port, s.from, strings.Join(s.to, ","), subject)
+	log.Printf("[:%d] %s -> %s  subject=%q from=%q reply-to=%q type=%q", s.b.port, s.from, strings.Join(s.to, ","), subject,
+		msg.Header.Get("From"), msg.Header.Get("Reply-To"), msg.Header.Get("Content-Type"))
 	return nil
 }
 

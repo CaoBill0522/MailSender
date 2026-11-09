@@ -18,5 +18,5 @@ RUN apk add --no-cache ca-certificates tzdata
 ENV TZ=Asia/Shanghai MS_DATA_DIR=/data MS_LISTEN=:8080
 COPY --from=build /mailsender /usr/local/bin/mailsender
 VOLUME /data
-EXPOSE 8080
+EXPOSE 8080 443 2525 465 587
 ENTRYPOINT ["mailsender"]

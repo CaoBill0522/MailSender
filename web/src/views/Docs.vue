@@ -43,6 +43,44 @@ X-API-Key: ms_xxxxxxxx</pre>
       <pre class="code">curl {{ origin }}/api/v1/messages/128 -H "Authorization: Bearer $KEY"</pre>
     </n-card>
 
+    <n-card size="small" title="SMTP 接入（像普通邮箱一样配置）">
+      <p>只支持填 SMTP 的程序（WordPress、Gitea、各种框架自带的邮件模块等）可以直接把本服务当作 SMTP 服务器，不用改代码。</p>
+      <n-alert v-if="!info?.smtp" type="warning" :show-icon="false">SMTP 接入未启用。启动时设置 <code>MS_SMTP_LISTEN</code>（如 :587）或 <code>MS_SMTPS_LISTEN</code>（如 :465）。</n-alert>
+      <template v-else>
+        <n-table size="small" :single-line="false" style="margin: 8px 0">
+          <tbody>
+            <tr><td style="width: 140px">SMTP 服务器</td><td class="mono">{{ smtpHost }}</td></tr>
+            <tr v-if="smtpsPort"><td>端口（推荐）</td><td><span class="mono">{{ smtpsPort }}</span>，加密方式选 <b>SSL/TLS</b></td></tr>
+            <tr v-if="smtpPort">
+              <td>端口</td>
+              <td>
+                <span class="mono">{{ smtpPort }}</span>，
+                <template v-if="info.smtp.starttls">加密方式选 <b>STARTTLS</b></template>
+                <template v-else>加密方式选 <b>无</b></template>
+              </td>
+            </tr>
+            <tr><td>用户名</td><td>任意，例如 <span class="mono">apikey</span></td></tr>
+            <tr><td>密码</td><td>在「API Key」页面创建的 Key（<span class="mono">ms_…</span>）</td></tr>
+            <tr><td>发件人地址</td><td>随意填写，发出时会被替换（见下文）</td></tr>
+            <tr><td>单封大小上限</td><td>{{ info.smtp.max_mib }} MB，最多 50 个收件人</td></tr>
+          </tbody>
+        </n-table>
+        <n-alert v-if="!info.smtp.starttls && smtpPort" type="warning" :show-icon="false" style="margin-bottom: 8px">
+          当前没有配置 TLS 证书，端口 {{ smtpPort }} 不加密，API Key 会以明文传输，只能在内网或本机使用。配置证书的方法见「系统设置 → 服务与证书」。
+        </n-alert>
+        <ul class="notes">
+          <li><b>发件人会被替换</b>：实际发出的 From 是轮询选中的真实账号（否则 SPF/DMARC 不通过、进垃圾箱）。你填写的显示名称会保留，原地址写入 Reply-To，收件人回复时仍回到原地址。</li>
+          <li>每个收件人（含抄送、密送）单独发送一次，分别计入统计和限额；附件和 HTML 原样转发。</li>
+          <li>程序会等到真正发出才返回成功；没有可用账号时返回 451（发送方会自动稍后重试），收件人不存在等永久错误返回 554。</li>
+          <li>同一收件人发送过于频繁时，在 RCPT 阶段返回 450，可稍后重试。</li>
+        </ul>
+        <p>示例（Python）：</p>
+        <pre class="code">{{ pySmtp }}</pre>
+        <p>示例（Node.js / Nodemailer）：</p>
+        <pre class="code">{{ nodeSmtp }}</pre>
+      </template>
+    </n-card>
+
     <n-card size="small" title="状态码">
       <n-table size="small" :single-line="false">
         <thead><tr><th>HTTP</th><th>code</th><th>含义</th></tr></thead>
@@ -61,9 +99,57 @@ X-API-Key: ms_xxxxxxxx</pre>
 </template>
 
 <script setup>
-import { NCard, NTable } from 'naive-ui'
+import { computed, onMounted, ref } from 'vue'
+import { NCard, NTable, NAlert } from 'naive-ui'
+import { api } from '../api'
 
 const origin = window.location.origin
+const info = ref(null)
+onMounted(async () => {
+  try { info.value = await api.get('/server-info') } catch {}
+})
+const portOf = (addr) => (addr ? addr.slice(addr.lastIndexOf(':') + 1) : '')
+const smtpHost = computed(() => info.value?.tls_domains?.[0] || info.value?.smtp?.hostname || window.location.hostname)
+const smtpPort = computed(() => portOf(info.value?.smtp?.listen))
+const smtpsPort = computed(() => portOf(info.value?.smtp?.listen_tls))
+const pySmtp = computed(() =>
+  smtpsPort.value
+    ? `import smtplib
+from email.message import EmailMessage
+
+msg = EmailMessage()
+msg["From"] = "我的应用 <noreply@myapp.com>"
+msg["To"] = "user@example.com"
+msg["Subject"] = "测试"
+msg.set_content("你好")
+
+with smtplib.SMTP_SSL("${smtpHost.value}", ${smtpsPort.value}) as s:
+    s.login("apikey", "ms_xxx")
+    s.send_message(msg)`
+    : `import smtplib
+from email.message import EmailMessage
+
+msg = EmailMessage()
+msg["From"] = "我的应用 <noreply@myapp.com>"
+msg["To"] = "user@example.com"
+msg["Subject"] = "测试"
+msg.set_content("你好")
+
+with smtplib.SMTP("${smtpHost.value}", ${smtpPort.value}) as s:
+${info.value?.smtp?.starttls ? '    s.starttls()\n' : ''}    s.login("apikey", "ms_xxx")
+    s.send_message(msg)`,
+)
+const nodeSmtp = computed(() => {
+  const secure = !!smtpsPort.value
+  const port = secure ? smtpsPort.value : smtpPort.value
+  return `const transporter = nodemailer.createTransport({
+  host: "${smtpHost.value}",
+  port: ${port},
+  secure: ${secure},${!secure && info.value?.smtp?.starttls ? '\n  requireTLS: true,' : ''}
+  auth: { user: "apikey", pass: "ms_xxx" },
+})
+await transporter.sendMail({ from: "我的应用 <noreply@myapp.com>", to: "user@example.com", subject: "测试", text: "你好" })`
+})
 const codeCurl = `curl -X POST ${origin}/api/v1/send/code \\
   -H "Authorization: Bearer $KEY" \\
   -H "Content-Type: application/json" \\
@@ -84,4 +170,5 @@ curl -X POST ${origin}/api/v1/send \\
 .code { background: rgba(127, 127, 127, 0.1); padding: 12px 14px; border-radius: 6px; overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.6; margin: 8px 0; }
 code { background: rgba(127, 127, 127, 0.12); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
 p { margin: 6px 0; font-size: 14px; }
+.notes { margin: 8px 0; padding-left: 18px; line-height: 1.8; font-size: 13.5px; }
 </style>
