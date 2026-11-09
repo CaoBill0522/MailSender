@@ -76,6 +76,14 @@
             <div class="hint" style="margin: 6px 0 0">发往这些域名（含子域名）时优先用本账号，例如 qq.com、foxmail.com；失败后仍会换其他账号</div>
           </div>
         </n-form-item>
+        <n-form-item label="出口">
+          <div style="width: 100%">
+            <n-select v-model:value="form.proxy_id" :options="proxyOptions" />
+            <div class="hint" style="margin: 6px 0 0">
+              登录这个账号的 SMTP 服务器时从哪个 IP 出去。代理在「<router-link to="/proxies">出口代理</router-link>」中添加；代理不可用时本账号发送失败并换其他账号，不会改用服务器本机 IP。
+            </div>
+          </div>
+        </n-form-item>
         <n-form-item label="备注">
           <n-input v-model:value="form.remark" type="textarea" :rows="2" />
         </n-form-item>
@@ -139,13 +147,20 @@ const authOptions = [
 const empty = () => ({
   id: 0, name: '', host: '', port: 465, security: 'ssl', auth_type: 'auto', username: '', password: '', from_addr: '', from_name: '',
   weight: 1, limit_per_minute: 0, limit_per_hour: 0, limit_per_day: 0, enabled: true, remark: '', has_password: false,
-  groups: '', prefer_domains: '',
+  groups: '', prefer_domains: '', proxy_id: 0,
 })
 const list = (v) => (v ? v.split(',').filter(Boolean) : [])
 const groupsArr = computed({ get: () => list(form.groups), set: (v) => (form.groups = v.join(',')) })
 const domainsArr = computed({ get: () => list(form.prefer_domains), set: (v) => (form.prefer_domains = v.join(',')) })
 const groupOptions = computed(() => [...new Set(rows.value.flatMap((a) => list(a.groups)))].sort().map((g) => ({ label: g, value: g })))
 const form = reactive(empty())
+const proxies = ref([])
+const proxyById = computed(() => Object.fromEntries(proxies.value.map((p) => [p.id, p])))
+const proxyOptions = computed(() => [
+  { label: '直连（服务器本机 IP）', value: 0 },
+  ...proxies.value.map((p) => ({ label: `${p.name}${p.last_ip ? ' · ' + p.last_ip : ''}（已有 ${p.accounts.length} 个账号）`, value: p.id })),
+])
+const egressText = (a) => (a.proxy_id ? '出口：' + (proxyById.value[a.proxy_id]?.name || '#' + a.proxy_id) : '直连')
 const showForm = ref(false)
 const saving = ref(false)
 
@@ -282,7 +297,16 @@ const columns = [
           : null,
       ]),
   },
-  { title: '服务器', key: 'host', width: 200, render: (a) => h('div', [h('div', { class: 'mono', style: 'font-size:12px' }, `${a.host}:${a.port}`), h('div', { class: 'muted' }, a.security.toUpperCase())]) },
+  {
+    title: '服务器',
+    key: 'host',
+    width: 200,
+    render: (a) =>
+      h('div', [
+        h('div', { class: 'mono', style: 'font-size:12px' }, `${a.host}:${a.port}`),
+        h('div', { class: 'muted' }, `${a.security.toUpperCase()} · ${egressText(a)}`),
+      ]),
+  },
   {
     title: '状态',
     key: 'status',
@@ -336,7 +360,7 @@ const columns = [
 async function load() {
   loading.value = !rows.value.length
   try {
-    rows.value = await api.get('/accounts')
+    ;[rows.value, proxies.value] = await Promise.all([api.get('/accounts'), api.get('/proxies')])
   } catch (e) {
     message.error(e.message)
   } finally {

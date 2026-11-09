@@ -51,19 +51,28 @@ func (k Kind) String() string {
 	}
 }
 
-func newClient(acc *store.Account, password string, timeout time.Duration) (*mail.Client, error) {
+func newClient(acc *store.Account, password string, dial Dialer, timeout time.Duration) (*mail.Client, error) {
+	tlsCfg := &tls.Config{ServerName: acc.Host, MinVersion: tls.VersionTLS12}
 	opts := []mail.Option{
 		mail.WithPort(acc.Port),
 		mail.WithTimeout(timeout),
-		mail.WithTLSConfig(&tls.Config{ServerName: acc.Host, MinVersion: tls.VersionTLS12}),
+		mail.WithTLSConfig(tlsCfg),
 	}
-	switch acc.Security {
-	case "ssl":
+	switch {
+	case acc.Security == "ssl" && dial != nil:
+		// go-mail only wraps TLS around its own dialer: do the handshake ourselves. The client then
+		// sees a *tls.Conn and treats the session as encrypted (no STARTTLS offered, which is fine).
+		opts = append(opts, mail.WithDialContextFunc(mail.DialContextFunc(tlsDialer(dial, tlsCfg))), mail.WithTLSPolicy(mail.TLSOpportunistic))
+		dial = nil
+	case acc.Security == "ssl":
 		opts = append(opts, mail.WithSSL())
-	case "starttls":
+	case acc.Security == "starttls":
 		opts = append(opts, mail.WithTLSPolicy(mail.TLSMandatory))
 	default:
 		opts = append(opts, mail.WithTLSPolicy(mail.NoTLS))
+	}
+	if dial != nil {
+		opts = append(opts, mail.WithDialContextFunc(mail.DialContextFunc(dial)))
 	}
 	if acc.AuthType != "none" {
 		var at mail.SMTPAuthType
@@ -92,10 +101,10 @@ func newClient(acc *store.Account, password string, timeout time.Duration) (*mai
 	return mail.NewClient(acc.Host, opts...)
 }
 
-// Send delivers one message through the account.
-func Send(ctx context.Context, acc *store.Account, password string, c Content, timeout time.Duration) error {
+// Send delivers one message through the account. dial is the egress proxy, nil for direct.
+func Send(ctx context.Context, acc *store.Account, password string, dial Dialer, c Content, timeout time.Duration) error {
 	if len(c.Raw) > 0 {
-		return sendRaw(ctx, acc, password, c, timeout)
+		return sendRaw(ctx, acc, password, dial, c, timeout)
 	}
 	m := mail.NewMsg()
 	if err := m.FromFormat(acc.FromName, acc.FromAddr); err != nil {
@@ -118,7 +127,7 @@ func Send(ctx context.Context, acc *store.Account, password string, c Content, t
 	default:
 		m.SetBodyString(mail.TypeTextPlain, c.Text)
 	}
-	cl, err := newClient(acc, password, timeout)
+	cl, err := newClient(acc, password, dial, timeout)
 	if err != nil {
 		return err
 	}
@@ -126,8 +135,8 @@ func Send(ctx context.Context, acc *store.Account, password string, c Content, t
 }
 
 // Test connects and authenticates without sending anything.
-func Test(ctx context.Context, acc *store.Account, password string, timeout time.Duration) error {
-	cl, err := newClient(acc, password, timeout)
+func Test(ctx context.Context, acc *store.Account, password string, dial Dialer, timeout time.Duration) error {
+	cl, err := newClient(acc, password, dial, timeout)
 	if err != nil {
 		return err
 	}
@@ -169,6 +178,10 @@ func Classify(err error) Kind {
 	var re *recipientError
 	if errors.As(err, &re) {
 		return KindRecipient
+	}
+	var pe *ProxyError
+	if errors.As(err, &pe) {
+		return KindAccount // proxy trouble: try another account, never treat it as bad SMTP credentials
 	}
 	code := Code(err)
 	msg := strings.ToLower(err.Error())

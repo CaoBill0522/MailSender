@@ -9,6 +9,7 @@ const routes = [
     children: [
       { path: '', component: () => import('./views/Dashboard.vue'), meta: { title: '概览' } },
       { path: 'accounts', component: () => import('./views/Accounts.vue'), meta: { title: 'SMTP 账号' } },
+      { path: 'proxies', component: () => import('./views/Proxies.vue'), meta: { title: '出口代理' } },
       { path: 'keys', component: () => import('./views/ApiKeys.vue'), meta: { title: 'API Key' } },
       { path: 'messages', component: () => import('./views/Messages.vue'), meta: { title: '发送日志' } },
       { path: 'suppressions', component: () => import('./views/Suppressions.vue'), meta: { title: '退信名单' } },

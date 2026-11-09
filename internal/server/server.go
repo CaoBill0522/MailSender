@@ -57,6 +57,13 @@ func (s *Server) Handler(trustedProxies []string) http.Handler {
 	ad.POST("/accounts/check-all", s.checkAllAccounts)
 	ad.GET("/groups", s.listGroups)
 
+	ad.GET("/proxies", s.listProxies)
+	ad.POST("/proxies", s.saveProxy)
+	ad.PUT("/proxies/:id", s.saveProxy)
+	ad.DELETE("/proxies/:id", s.deleteProxy)
+	ad.POST("/proxies/:id/check", s.checkProxy)
+	ad.POST("/proxies/direct-ip", s.directIP)
+
 	ad.GET("/keys", s.listKeys)
 	ad.POST("/keys", s.createKey)
 	ad.PUT("/keys/:id", s.updateKey)

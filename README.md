@@ -9,6 +9,7 @@
 - **熔断**：连续失败达到阈值后冷却（认证失败立即冷却），并定时做登录健康检测
 - **防刷**：限制同一收件人的发送间隔和每日上限；API Key 级别限流和 IP 白名单
 - **分组与路由**：账号可打分组标签，API Key 只用指定分组的账号；账号可设「优先收件域名」，例如发往 qq.com 优先用 QQ 邮箱
+- **出口代理**：账号可指定 SOCKS5 代理，不同账号从不同 IP 登录邮箱，避免同一服务商看到多个账号来自同一 IP；代理不可用时换号重试，不会回退到服务器本机 IP
 - **退信名单**：收件地址被永久拒收（地址不存在等）后自动拉黑，之后在 RCPT 阶段直接返回 550，保护发件账号信誉
 - **告警**：账号冷却和恢复、没有可用账号、失败率过高、IP 被封禁时，推送到企业微信、钉钉、飞书、Telegram 或通用 Webhook
 - **投递回调**：每封信有结果后，向 API Key 配置的地址 POST 一个带 HMAC 签名的 JSON，可用 `X-MS-Ref` 头关联业务记录
@@ -97,6 +98,22 @@ MS_SMTPS_LISTEN=:465 MS_SMTP_LISTEN=:587 ./bin/mailsender
 ```
 
 `ref` 是邮件头 `X-MS-Ref` 的值（发出前会删掉）。请求头 `X-MailSender-Signature: sha256=<hex>` 是用 Key 的签名密钥对 `X-MailSender-Timestamp + "." + 请求体` 做的 HMAC-SHA256，接收端应校验签名并拒绝过旧的时间戳。
+
+### 出口代理
+
+在后台「出口代理」中添加 SOCKS5 代理（可粘贴 `socks5://用户名:密码@主机:端口`），再在账号的「出口」中选择。检测按钮会通过代理访问 IP 回显服务（api.ipify.org 等），显示实际出口 IP。代理端负责解析域名。
+
+不花钱的做法是用 SSH 隧道，代理只监听服务器本机：
+
+```bash
+# 家里的电脑或路由器（内网也可以）把出口提供给服务器：服务器上出现 127.0.0.1:1081
+ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -R 127.0.0.1:1081 root@服务器
+
+# 服务器借用一台免费云主机的 IP：服务器上出现 127.0.0.1:1082
+ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes -D 127.0.0.1:1082 user@云主机
+```
+
+用 autossh 或 systemd 保持隧道。隧道断开时，用它的账号会发送失败并切换到其他账号。
 
 ## Docker
 
